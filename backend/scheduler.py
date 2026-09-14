@@ -2,13 +2,11 @@ import asyncio
 
 from backend import pipeline
 
-# Default scan interval — mirrors app.py's sidebar slider default. Exposed as a mutable
-# module-level value so a future POST /api/settings could adjust it without a restart.
-REFRESH_INTERVAL_SECONDS = 30
-
 # Ticks fast (the same 5s cadence app.py's fragment used) so any backlog of already-queued
 # headlines drains quickly, while fetch_live_financial_news() itself is only actually
-# called once REFRESH_INTERVAL_SECONDS has elapsed (checked inside run_pipeline_cycle).
+# called once pipeline.state.refresh_interval_seconds has elapsed (checked inside
+# run_pipeline_cycle). The interval and active/paused flag now live on pipeline.state
+# instead of a module constant here, so PATCH /api/settings can change them live.
 TICK_SECONDS = 5
 
 _task = None
@@ -17,7 +15,7 @@ _task = None
 async def _loop():
     while True:
         try:
-            pipeline.run_pipeline_cycle(REFRESH_INTERVAL_SECONDS)
+            pipeline.run_pipeline_cycle()
         except Exception as e:
             pipeline.report_error("Scheduler loop", e)
         await asyncio.sleep(TICK_SECONDS)

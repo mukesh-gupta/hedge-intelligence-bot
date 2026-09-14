@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 trade_history.json
 processed_headlines.json
+watchlist.json

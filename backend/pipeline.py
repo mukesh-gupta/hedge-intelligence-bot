@@ -28,6 +28,19 @@ TRADE_HISTORY_FILE = "trade_history.json"
 MAX_STORED_ALERTS = 200
 PROCESSED_HEADLINES_FILE = "processed_headlines.json"
 MAX_STORED_HEADLINES = 500
+WATCHLIST_FILE = "watchlist.json"
+DEFAULT_WATCHLIST = [
+    {"symbol": "NDAQ", "label": "NDAQ"},
+    {"symbol": "MS", "label": "MS"},
+    {"symbol": "GS", "label": "GS"},
+    {"symbol": "ICE", "label": "ICE"},
+    {"symbol": "NVDA", "label": "NVDA"},
+    {"symbol": "ORCL", "label": "ORCL"},
+    {"symbol": "AAPL", "label": "AAPL"},
+    {"symbol": "TSLA", "label": "TSLA"},
+    {"symbol": "GC=F", "label": "GOLD"},
+    {"symbol": "BTC-USD", "label": "BTC"},
+]
 
 
 class PipelineState:
@@ -53,6 +66,13 @@ class PipelineState:
         self.last_error = None
         self.ai_unavailable_until = 0
         self.last_scan_time = 0
+
+        # Runtime-adjustable settings — mutable via PATCH /api/settings instead of being
+        # fixed constants, so the React Settings screen can actually control the scheduler.
+        self.refresh_interval_seconds = 30
+        self.active = True
+
+        self.watchlist = load_watchlist()
 
     def roll_daily_usage_if_needed(self):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -97,6 +117,22 @@ def save_processed_headlines(headlines_set):
             json.dump(trimmed, f)
     except Exception as e:
         report_error("Persisting seen-headlines", e)
+
+
+def load_watchlist():
+    try:
+        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return list(DEFAULT_WATCHLIST)
+
+
+def save_watchlist(watchlist):
+    try:
+        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(watchlist, f)
+    except Exception as e:
+        report_error("Persisting watchlist", e)
 
 
 def report_error(source, message):
@@ -572,6 +608,8 @@ def run_deep_analysis(headline, sector, resolved_ticker, ripple_effects):
     {ripple_note}
     Provide an institutional-grade trading setup across US Stocks, Indian Markets, Global Stocks, Crypto, and Commodities.
     Keep the strategy field to 2-3 concise sentences (under 60 words) — no filler, no repetition.
+    Also write a one-sentence plain-language summary of what happened and why it matters (under 30 words,
+    distinct from both the headline and the key takeaways — this is the expanded explanation shown under the headline).
     Also classify this headline into exactly one category: "Signal" (a clear tradeable setup),
     "Market News" (routine price/market movement), "Analysis" (broader trend commentary),
     "Alert" (urgent/breaking risk event), "Trade Idea" (a specific actionable position), or
@@ -580,6 +618,7 @@ def run_deep_analysis(headline, sector, resolved_ticker, ripple_effects):
     {{
         "sentiment": "STRONG_BULLISH / WEAK_BULLISH / BEARISH",
         "sector": "Sector name",
+        "summary": "One-sentence plain-language explanation of the news and its market relevance.",
         "buy_targets": ["Ticker1", "Ticker2"],
         "sell_targets": ["Ticker1", "Ticker2"],
         "strategy": "Concise action to take before market open, referencing the real data if provided.",
@@ -668,16 +707,20 @@ def category_style(category):
     return CATEGORY_STYLE.get(category, {"icon": "📊", "color": "#6b7280"})
 
 
-def run_pipeline_cycle(refresh_interval):
+def run_pipeline_cycle():
     """One tick of the pipeline: scan feeds if the interval elapsed and the queue is
     empty, then batch-filter or deep-analyze whatever is in the queue. This is the same
     logic that used to live inline in app.py's pipeline_fragment(), just without any
-    Streamlit UI calls — the scheduler calls this repeatedly in the background."""
+    Streamlit UI calls — the scheduler calls this repeatedly in the background.
+    Reads refresh_interval_seconds/active from state so PATCH /api/settings can change
+    behavior at runtime without restarting the scheduler."""
     state.roll_daily_usage_if_needed()
+    if not state.active:
+        return None
     now = time.time()
 
     if (not state.pending_headlines and not state.qualified_headlines
-            and now - state.last_scan_time >= refresh_interval):
+            and now - state.last_scan_time >= state.refresh_interval_seconds):
         new_headlines = fetch_live_financial_news()
         state.last_scan_time = now
         if new_headlines:
@@ -720,6 +763,7 @@ def run_pipeline_cycle(refresh_interval):
     new_alert = {
         "Timestamp": datetime.now().strftime("%I:%M:%S %p"),
         "Headline": headline,
+        "Summary": ai_blueprint.get("summary"),
         "Sentiment": ai_blueprint.get("sentiment"),
         "Sector": ai_blueprint.get("sector"),
         "Buy Tickers": ", ".join(ai_blueprint.get("buy_targets", [])),
@@ -735,3 +779,187 @@ def run_pipeline_cycle(refresh_interval):
     state.trade_history.insert(0, new_alert)
     save_trade_history(state.trade_history)
     return new_alert
+
+
+# --- MARKET REGIME ---
+def compute_market_regime(lookback=20):
+    """A deterministic Risk-On/Risk-Off/Neutral read derived from the bullish-vs-bearish
+    split of our own most recent AI signals — not a separate AI call, since we already have
+    real, grounded sentiment data sitting in trade_history. Avoids inventing a new opaque
+    "vibes" metric on top of data that's already there."""
+    recent = state.trade_history[:lookback]
+    if not recent:
+        return {"regime": "Neutral", "bullish": 0, "bearish": 0, "score": 0}
+    bullish = sum(1 for a in recent if "BULLISH" in (a.get("Sentiment") or "").upper())
+    bearish = sum(1 for a in recent if "BEARISH" in (a.get("Sentiment") or "").upper())
+    total = bullish + bearish
+    score = round(((bullish - bearish) / total) * 100, 1) if total else 0
+    if score > 20:
+        regime = "Risk-On"
+    elif score < -20:
+        regime = "Risk-Off"
+    else:
+        regime = "Neutral"
+    return {"regime": regime, "bullish": bullish, "bearish": bearish, "score": score}
+
+
+# --- PRICE HISTORY (for sparkline charts) ---
+def fetch_price_history(ticker, points=20):
+    """Last `points` daily closes for a symbol — used for the small sparkline charts on
+    the Market Data screen. Cached alongside the regular market data cache."""
+    cache_key = f"HISTORY:{ticker}:{points}"
+    cached = get_cached_market_data(cache_key)
+    if cached:
+        return cached
+    try:
+        hist = yf.Ticker(ticker).history(period="3mo", timeout=10)
+        if hist.empty:
+            return None
+        closes = [round(float(c), 2) for c in hist["Close"].tolist()[-points:]]
+        set_cached_market_data(cache_key, closes, "yf")
+        return closes
+    except Exception:
+        return None
+
+
+# --- CATEGORIZED MARKET DATA (Indices / Commodities / Forex / Bonds) ---
+MARKET_DATA_CATEGORIES = {
+    "indices": [
+        ("^GSPC", "S&P 500"),
+        ("^IXIC", "NASDAQ"),
+        ("^DJI", "DOW"),
+        ("^NSEI", "NIFTY 50"),
+        ("^BSESN", "SENSEX"),
+        ("^NSEBANK", "BANK NIFTY"),
+    ],
+    "commodities": [
+        ("GC=F", "GOLD"),
+        ("SI=F", "SILVER"),
+        ("CL=F", "OIL (WTI)"),
+        ("BZ=F", "BRENT"),
+        ("HG=F", "COPPER"),
+        ("NG=F", "NATURAL GAS"),
+    ],
+    "forex": [
+        ("DX-Y.NYB", "DXY"),
+        ("EURUSD=X", "EUR/USD"),
+        ("GBPUSD=X", "GBP/USD"),
+        ("USDJPY=X", "USD/JPY"),
+        ("USDINR=X", "USD/INR"),
+    ],
+    "bonds": [
+        ("^IRX", "US 3M YIELD"),
+        ("^FVX", "US 5Y YIELD"),
+        ("^TNX", "US 10Y YIELD"),
+        ("^TYX", "US 30Y YIELD"),
+    ],
+}
+
+
+def fetch_market_data_category(category, with_history=True, history_points=20):
+    """Returns [{symbol, label, price, change_percent, rsi, as_of, history:[...]}] for one
+    of indices/commodities/forex/bonds — the data source for the Market Data screen's tabs
+    and sparklines."""
+    symbols = MARKET_DATA_CATEGORIES.get(category)
+    if symbols is None:
+        return None
+    rows = []
+    for symbol, label in symbols:
+        data = fetch_ticker_bar_data(symbol) or {}
+        row = {"symbol": symbol, "label": label, **data}
+        if with_history:
+            row["history"] = fetch_price_history(symbol, history_points)
+        rows.append(row)
+    return rows
+
+
+# --- SECTOR PERFORMANCE (real ETF price data, not just signal counts) ---
+SECTOR_ETF_MAP = {
+    "Energy": "XLE",
+    "Financials": "XLF",
+    "Technology": "XLK",
+    "Semiconductors": "SMH",
+    "Consumer Staples": "XLP",
+    "Consumer Discretionary": "XLY",
+    "Healthcare": "XLV",
+    "Industrials": "XLI",
+    "Materials": "XLB",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Communication Services": "XLC",
+}
+
+TIMEFRAME_LOOKBACK_TRADING_DAYS = {"1D": 1, "1W": 5, "1M": 21, "1Y": 252}
+
+
+def _sector_signal_count(sector_label):
+    """Loose case-insensitive substring match against the AI's free-text sector field —
+    the AI doesn't pick from SECTOR_ETF_MAP's fixed list, so exact matching would undercount."""
+    label_lower = sector_label.lower()
+    count = 0
+    for alert in state.trade_history:
+        alert_sector = (alert.get("Sector") or "").lower()
+        if label_lower in alert_sector or alert_sector in label_lower:
+            count += 1
+    return count
+
+
+def fetch_sector_performance(timeframe="1D"):
+    """Real % price change per sector ETF over the requested timeframe, plus how many of
+    our own AI signals have touched that sector. One 1-year history fetch per ETF (cached)
+    covers every timeframe by just changing how far back we look for the comparison close."""
+    lookback = TIMEFRAME_LOOKBACK_TRADING_DAYS.get(timeframe, 1)
+    rows = []
+    for sector, etf_symbol in SECTOR_ETF_MAP.items():
+        cache_key = f"SECTORHIST:{etf_symbol}"
+        closes = get_cached_market_data(cache_key)
+        if not closes:
+            try:
+                hist = yf.Ticker(etf_symbol).history(period="1y", timeout=10)
+                closes = hist["Close"].tolist() if not hist.empty else None
+                if closes:
+                    set_cached_market_data(cache_key, closes, "yf")
+            except Exception:
+                closes = None
+        if not closes:
+            rows.append({"sector": sector, "symbol": etf_symbol, "change_percent": None, "signal_count": _sector_signal_count(sector)})
+            continue
+        latest = closes[-1]
+        base_idx = max(0, len(closes) - 1 - lookback)
+        base = closes[base_idx]
+        change_percent = round(((latest - base) / base) * 100, 2) if base else None
+        rows.append({
+            "sector": sector,
+            "symbol": etf_symbol,
+            "change_percent": change_percent,
+            "signal_count": _sector_signal_count(sector)
+        })
+    return rows
+
+
+# --- WATCHLIST ---
+def add_to_watchlist(symbol, label=None):
+    symbol = symbol.strip().upper()
+    if any(w["symbol"] == symbol for w in state.watchlist):
+        return state.watchlist
+    state.watchlist.append({"symbol": symbol, "label": label or symbol})
+    save_watchlist(state.watchlist)
+    return state.watchlist
+
+
+def remove_from_watchlist(symbol):
+    symbol = symbol.strip().upper()
+    state.watchlist = [w for w in state.watchlist if w["symbol"] != symbol]
+    save_watchlist(state.watchlist)
+    return state.watchlist
+
+
+def fetch_watchlist_quotes():
+    """Live price/change for every symbol on the watchlist — reuses the same yfinance
+    fetch + cache path as everything else, just for user-picked symbols instead of a
+    fixed list."""
+    rows = []
+    for entry in state.watchlist:
+        data = fetch_ticker_bar_data(entry["symbol"]) or {}
+        rows.append({"symbol": entry["symbol"], "label": entry["label"], **data})
+    return rows

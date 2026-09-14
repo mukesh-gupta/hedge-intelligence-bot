@@ -1,8 +1,10 @@
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from backend import pipeline, scheduler
 
@@ -71,3 +73,68 @@ def trigger_scan():
     new_headlines = pipeline.fetch_live_financial_news()
     pipeline.state.pending_headlines.extend(new_headlines)
     return {"new_headlines_found": len(new_headlines)}
+
+
+@app.get("/api/market-regime")
+def get_market_regime():
+    return pipeline.compute_market_regime()
+
+
+@app.get("/api/market-data")
+def get_market_data(category: str = "indices", history: bool = True):
+    rows = pipeline.fetch_market_data_category(category, with_history=history)
+    if rows is None:
+        raise HTTPException(status_code=400, detail=f"Unknown category '{category}'. Valid: {list(pipeline.MARKET_DATA_CATEGORIES.keys())}")
+    return {"category": category, "assets": rows}
+
+
+@app.get("/api/sectors")
+def get_sectors(timeframe: str = "1D"):
+    if timeframe not in pipeline.TIMEFRAME_LOOKBACK_TRADING_DAYS:
+        raise HTTPException(status_code=400, detail=f"Unknown timeframe '{timeframe}'. Valid: {list(pipeline.TIMEFRAME_LOOKBACK_TRADING_DAYS.keys())}")
+    return {"timeframe": timeframe, "sectors": pipeline.fetch_sector_performance(timeframe)}
+
+
+@app.get("/api/watchlist")
+def get_watchlist():
+    return {"watchlist": pipeline.fetch_watchlist_quotes()}
+
+
+class WatchlistAddRequest(BaseModel):
+    symbol: str
+    label: Optional[str] = None
+
+
+@app.post("/api/watchlist")
+def post_watchlist(body: WatchlistAddRequest):
+    updated = pipeline.add_to_watchlist(body.symbol, body.label)
+    return {"watchlist": updated}
+
+
+@app.delete("/api/watchlist/{symbol}")
+def delete_watchlist(symbol: str):
+    updated = pipeline.remove_from_watchlist(symbol)
+    return {"watchlist": updated}
+
+
+@app.get("/api/settings")
+def get_settings():
+    s = pipeline.state
+    return {"active": s.active, "refresh_interval_seconds": s.refresh_interval_seconds}
+
+
+class SettingsUpdateRequest(BaseModel):
+    active: Optional[bool] = None
+    refresh_interval_seconds: Optional[int] = None
+
+
+@app.patch("/api/settings")
+def patch_settings(body: SettingsUpdateRequest):
+    s = pipeline.state
+    if body.active is not None:
+        s.active = body.active
+    if body.refresh_interval_seconds is not None:
+        if not (5 <= body.refresh_interval_seconds <= 3600):
+            raise HTTPException(status_code=400, detail="refresh_interval_seconds must be between 5 and 3600")
+        s.refresh_interval_seconds = body.refresh_interval_seconds
+    return {"active": s.active, "refresh_interval_seconds": s.refresh_interval_seconds}
