@@ -22,7 +22,15 @@ _market_data_task = None
 async def _pipeline_loop():
     while True:
         try:
-            pipeline.run_pipeline_cycle()
+            # run_pipeline_cycle() is fully synchronous/blocking under the hood — feedparser,
+            # requests.get/post for the RSS feeds and AI providers, yfinance calls, and even a
+            # literal time.sleep() for Alpha Vantage's rate-limit pacing. FastAPI/uvicorn runs
+            # on a single event loop, so calling it directly here froze request handling for
+            # every connected client (including trivial in-memory endpoints like /api/status)
+            # for as long as that blocking call took — observed live as a 35s hang on
+            # /api/status while a scan/analysis cycle was in progress. asyncio.to_thread runs
+            # it on a worker thread instead, so the event loop stays free to serve requests.
+            await asyncio.to_thread(pipeline.run_pipeline_cycle)
         except Exception as e:
             pipeline.report_error("Scheduler loop", e)
         await asyncio.sleep(TICK_SECONDS)
