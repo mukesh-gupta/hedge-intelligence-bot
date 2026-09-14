@@ -75,6 +75,15 @@ class PipelineState:
 
         self.watchlist = load_watchlist()
 
+        # Pre-computed, request-ready results the warmer writes to and every GET endpoint
+        # reads from directly — never live-fetched inline during a request, no matter how
+        # stale, so a slow/throttled yfinance call can never show up as request latency.
+        self.cached_ticker_bar = []
+        self.cached_market_data = {}
+        self.cached_sectors = {}
+        self.cached_watchlist = []
+        self.cache_last_updated = None
+
     def roll_daily_usage_if_needed(self):
         today = datetime.now().strftime("%Y-%m-%d")
         if self.token_usage_date != today:
@@ -967,29 +976,66 @@ def fetch_watchlist_quotes():
 
 
 # --- CACHE WARMING ---
+def refresh_watchlist_cache():
+    """Synchronous, on-demand refresh of just the watchlist cache — called right after a
+    POST/DELETE mutation so the change is visible immediately instead of waiting for the
+    next scheduled warm cycle (up to MARKET_DATA_WARM_SECONDS later)."""
+    state.cached_watchlist = fetch_watchlist_quotes()
+    return state.cached_watchlist
+
+
 def prefetch_all_market_data():
     """Proactively refreshes every market-data cache (ticker bar, all 4 categories, all
-    4 sector timeframes, watchlist) in parallel threads. yfinance/requests calls are
-    blocking network I/O, so run them concurrently instead of one-by-one — otherwise
-    warming ~30 symbols sequentially could take 20-30s instead of a couple of seconds.
-    Called on a timer by the scheduler so that by the time an HTTP request arrives, the
-    GET endpoints just read already-cached data (a dict lookup) instead of ever blocking
-    on a live fetch — this is what keeps API responses in the low milliseconds."""
-    jobs = []
+    4 sector timeframes, watchlist) in parallel threads and writes the FINAL, request-ready
+    results into state.cached_* — GET endpoints read only from these fields and never fall
+    back to a live fetch themselves. That distinction matters: the underlying fetch_*
+    helpers each have their own short TTL cache (get_cached_market_data), so if request
+    handlers called them directly, a slow/throttled network call on a free-tier shared vCPU
+    could still occasionally block a request for many seconds once that TTL expires mid-cycle
+    (observed live: a 46s spike). Serving strictly from state.cached_* means a request always
+    gets an instant answer — worst case, an answer that's one warm cycle old, never a hang.
+    yfinance/requests calls are blocking network I/O, so run them concurrently instead of
+    one-by-one — otherwise warming ~30 symbols sequentially could take 20-30s instead of a
+    couple of seconds."""
     # Kept modest (not e.g. 10+) because free-tier hosts (Render's free plan) give a single
     # shared vCPU — too many concurrent threads contend for the GIL hard enough to visibly
     # delay request-handling on the main thread, even though each individual call is I/O-bound.
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        for symbol, _ in TICKER_BAR_SYMBOLS:
-            jobs.append(executor.submit(fetch_ticker_bar_data, symbol))
-        for category in MARKET_DATA_CATEGORIES:
-            jobs.append(executor.submit(fetch_market_data_category, category))
-        for timeframe in TIMEFRAME_LOOKBACK_TRADING_DAYS:
-            jobs.append(executor.submit(fetch_sector_performance, timeframe))
-        jobs.append(executor.submit(fetch_watchlist_quotes))
+        ticker_futures = {executor.submit(fetch_ticker_bar_data, symbol): (symbol, label) for symbol, label in TICKER_BAR_SYMBOLS}
+        category_futures = {executor.submit(fetch_market_data_category, category): category for category in MARKET_DATA_CATEGORIES}
+        sector_futures = {executor.submit(fetch_sector_performance, tf): tf for tf in TIMEFRAME_LOOKBACK_TRADING_DAYS}
+        watchlist_future = executor.submit(fetch_watchlist_quotes)
 
-        for job in concurrent.futures.as_completed(jobs):
+        new_ticker_bar = []
+        for future in concurrent.futures.as_completed(ticker_futures):
+            symbol, label = ticker_futures[future]
             try:
-                job.result()
+                data = future.result()
             except Exception as e:
-                report_error("Market data prefetch", e)
+                report_error("Market data prefetch (ticker bar)", e)
+                data = None
+            new_ticker_bar.append({"symbol": symbol, "label": label, "data": data})
+        symbol_order = {symbol: i for i, (symbol, _) in enumerate(TICKER_BAR_SYMBOLS)}
+        new_ticker_bar.sort(key=lambda row: symbol_order[row["symbol"]])
+        state.cached_ticker_bar = new_ticker_bar
+
+        for future in concurrent.futures.as_completed(category_futures):
+            category = category_futures[future]
+            try:
+                state.cached_market_data[category] = future.result()
+            except Exception as e:
+                report_error("Market data prefetch (category)", e)
+
+        for future in concurrent.futures.as_completed(sector_futures):
+            timeframe = sector_futures[future]
+            try:
+                state.cached_sectors[timeframe] = future.result()
+            except Exception as e:
+                report_error("Market data prefetch (sectors)", e)
+
+        try:
+            state.cached_watchlist = watchlist_future.result()
+        except Exception as e:
+            report_error("Market data prefetch (watchlist)", e)
+
+    state.cache_last_updated = time.time()

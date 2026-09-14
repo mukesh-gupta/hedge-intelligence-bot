@@ -47,11 +47,10 @@ def get_signals():
 
 @app.get("/api/ticker-bar")
 def get_ticker_bar():
-    rows = []
-    for symbol, label in pipeline.TICKER_BAR_SYMBOLS:
-        data = pipeline.fetch_ticker_bar_data(symbol)
-        rows.append({"symbol": symbol, "label": label, "data": data})
-    return {"ticker_bar": rows}
+    """Reads strictly from the pre-warmed cache — never triggers a live fetch itself, so
+    this always answers instantly even if yfinance is slow or Render's shared CPU is
+    throttled at that moment. See prefetch_all_market_data() for why."""
+    return {"ticker_bar": pipeline.state.cached_ticker_bar}
 
 
 @app.get("/api/usage")
@@ -77,6 +76,7 @@ def get_status():
         "market_data": bool(s.market_data_cache) or pipeline.ALPHAVANTAGE_API_KEY is not None,
         "ai_engine": not cooldown_active,
         "data_pipeline": s.last_error is None or not cooldown_active,
+        "cache_age_seconds": round(time.time() - s.cache_last_updated, 1) if s.cache_last_updated else None,
     }
 
 
@@ -94,9 +94,11 @@ def get_market_regime():
 
 @app.get("/api/market-data")
 def get_market_data(category: str = "indices", history: bool = True):
-    rows = pipeline.fetch_market_data_category(category, with_history=history)
-    if rows is None:
+    if category not in pipeline.MARKET_DATA_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"Unknown category '{category}'. Valid: {list(pipeline.MARKET_DATA_CATEGORIES.keys())}")
+    rows = pipeline.state.cached_market_data.get(category, [])
+    if not history:
+        rows = [{k: v for k, v in row.items() if k != "history"} for row in rows]
     return {"category": category, "assets": rows}
 
 
@@ -104,12 +106,12 @@ def get_market_data(category: str = "indices", history: bool = True):
 def get_sectors(timeframe: str = "1D"):
     if timeframe not in pipeline.TIMEFRAME_LOOKBACK_TRADING_DAYS:
         raise HTTPException(status_code=400, detail=f"Unknown timeframe '{timeframe}'. Valid: {list(pipeline.TIMEFRAME_LOOKBACK_TRADING_DAYS.keys())}")
-    return {"timeframe": timeframe, "sectors": pipeline.fetch_sector_performance(timeframe)}
+    return {"timeframe": timeframe, "sectors": pipeline.state.cached_sectors.get(timeframe, [])}
 
 
 @app.get("/api/watchlist")
 def get_watchlist():
-    return {"watchlist": pipeline.fetch_watchlist_quotes()}
+    return {"watchlist": pipeline.state.cached_watchlist}
 
 
 class WatchlistAddRequest(BaseModel):
@@ -119,14 +121,17 @@ class WatchlistAddRequest(BaseModel):
 
 @app.post("/api/watchlist")
 def post_watchlist(body: WatchlistAddRequest):
-    updated = pipeline.add_to_watchlist(body.symbol, body.label)
-    return {"watchlist": updated}
+    pipeline.add_to_watchlist(body.symbol, body.label)
+    # Mutations are rare, user-initiated, and expected to reflect immediately — unlike the
+    # GET above, it's fine for this one to do a real (small, ~10-symbol) live fetch inline
+    # rather than waiting for the next scheduled warm cycle.
+    return {"watchlist": pipeline.refresh_watchlist_cache()}
 
 
 @app.delete("/api/watchlist/{symbol}")
 def delete_watchlist(symbol: str):
-    updated = pipeline.remove_from_watchlist(symbol)
-    return {"watchlist": updated}
+    pipeline.remove_from_watchlist(symbol)
+    return {"watchlist": pipeline.refresh_watchlist_cache()}
 
 
 @app.get("/api/settings")
