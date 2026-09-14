@@ -976,7 +976,10 @@ def prefetch_all_market_data():
     GET endpoints just read already-cached data (a dict lookup) instead of ever blocking
     on a live fetch — this is what keeps API responses in the low milliseconds."""
     jobs = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # Kept modest (not e.g. 10+) because free-tier hosts (Render's free plan) give a single
+    # shared vCPU — too many concurrent threads contend for the GIL hard enough to visibly
+    # delay request-handling on the main thread, even though each individual call is I/O-bound.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         for symbol, _ in TICKER_BAR_SYMBOLS:
             jobs.append(executor.submit(fetch_ticker_bar_data, symbol))
         for category in MARKET_DATA_CATEGORIES:
