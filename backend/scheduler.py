@@ -9,10 +9,17 @@ from backend import pipeline
 # instead of a module constant here, so PATCH /api/settings can change them live.
 TICK_SECONDS = 5
 
-_task = None
+# Separate, faster-than-cache-TTL cadence for warming market-data caches (ticker bar,
+# categorized market data, sector performance, watchlist). YF_CACHE_SECONDS is 60, so
+# warming every 45s guarantees the cache never goes cold between refreshes — every
+# GET request hits an already-warm cache instead of blocking on a live yfinance call.
+MARKET_DATA_WARM_SECONDS = 45
+
+_pipeline_task = None
+_market_data_task = None
 
 
-async def _loop():
+async def _pipeline_loop():
     while True:
         try:
             pipeline.run_pipeline_cycle()
@@ -21,18 +28,35 @@ async def _loop():
         await asyncio.sleep(TICK_SECONDS)
 
 
+async def _market_data_warm_loop():
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            # prefetch_all_market_data() is blocking (thread-pooled network I/O internally),
+            # so run it off the event loop thread rather than freezing request handling.
+            await loop.run_in_executor(None, pipeline.prefetch_all_market_data)
+        except Exception as e:
+            pipeline.report_error("Market data warm loop", e)
+        await asyncio.sleep(MARKET_DATA_WARM_SECONDS)
+
+
 def start():
-    """Launch the background pipeline loop on the running event loop. Runs independent of
-    any connected HTTP client — this is the point of moving off Streamlit's run_every,
-    which only ticked while a browser tab with an open script-run was present."""
-    global _task
-    if _task is None or _task.done():
-        _task = asyncio.create_task(_loop())
-    return _task
+    """Launch both background loops on the running event loop. Runs independent of any
+    connected HTTP client — this is the point of moving off Streamlit's run_every, which
+    only ticked while a browser tab with an open script-run was present."""
+    global _pipeline_task, _market_data_task
+    if _pipeline_task is None or _pipeline_task.done():
+        _pipeline_task = asyncio.create_task(_pipeline_loop())
+    if _market_data_task is None or _market_data_task.done():
+        _market_data_task = asyncio.create_task(_market_data_warm_loop())
+    return _pipeline_task, _market_data_task
 
 
 def stop():
-    global _task
-    if _task is not None:
-        _task.cancel()
-        _task = None
+    global _pipeline_task, _market_data_task
+    if _pipeline_task is not None:
+        _pipeline_task.cancel()
+        _pipeline_task = None
+    if _market_data_task is not None:
+        _market_data_task.cancel()
+        _market_data_task = None

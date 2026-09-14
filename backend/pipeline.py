@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import os
 import re
@@ -963,3 +964,29 @@ def fetch_watchlist_quotes():
         data = fetch_ticker_bar_data(entry["symbol"]) or {}
         rows.append({"symbol": entry["symbol"], "label": entry["label"], **data})
     return rows
+
+
+# --- CACHE WARMING ---
+def prefetch_all_market_data():
+    """Proactively refreshes every market-data cache (ticker bar, all 4 categories, all
+    4 sector timeframes, watchlist) in parallel threads. yfinance/requests calls are
+    blocking network I/O, so run them concurrently instead of one-by-one — otherwise
+    warming ~30 symbols sequentially could take 20-30s instead of a couple of seconds.
+    Called on a timer by the scheduler so that by the time an HTTP request arrives, the
+    GET endpoints just read already-cached data (a dict lookup) instead of ever blocking
+    on a live fetch — this is what keeps API responses in the low milliseconds."""
+    jobs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for symbol, _ in TICKER_BAR_SYMBOLS:
+            jobs.append(executor.submit(fetch_ticker_bar_data, symbol))
+        for category in MARKET_DATA_CATEGORIES:
+            jobs.append(executor.submit(fetch_market_data_category, category))
+        for timeframe in TIMEFRAME_LOOKBACK_TRADING_DAYS:
+            jobs.append(executor.submit(fetch_sector_performance, timeframe))
+        jobs.append(executor.submit(fetch_watchlist_quotes))
+
+        for job in concurrent.futures.as_completed(jobs):
+            try:
+                job.result()
+            except Exception as e:
+                report_error("Market data prefetch", e)

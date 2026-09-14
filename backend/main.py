@@ -28,6 +28,18 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_response_time_header(request, call_next):
+    """Exposes exactly how fast each response was server-side, in milliseconds — proof
+    the GET endpoints are serving from the pre-warmed cache rather than blocking on a
+    live yfinance/AlphaVantage call (which would show up here as seconds, not ms)."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.1f}"
+    return response
+
+
 @app.get("/api/signals")
 def get_signals():
     return {"signals": pipeline.state.trade_history}
