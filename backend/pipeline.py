@@ -656,9 +656,21 @@ def fetch_live_financial_news():
                 if entry.title not in state.processed_headlines:
                     new_headlines_found.append(entry.title)
                     state.processed_headlines.add(entry.title)
+                    # entry.published_parsed is a UTC struct_time whenever the feed
+                    # supplies a <pubDate>/<published> element (confirmed present on
+                    # all 5 sources below). This is the article's real publish time,
+                    # not when our pipeline got around to analyzing it — falls back
+                    # to "now" only if a feed is ever missing it.
+                    published_struct = getattr(entry, "published_parsed", None)
+                    published_at = (
+                        datetime(*published_struct[:6]).isoformat() + "Z"
+                        if published_struct
+                        else datetime.utcnow().isoformat() + "Z"
+                    )
                     state.headline_metadata[entry.title] = {
                         "link": getattr(entry, "link", None),
-                        "source": RSS_SOURCE_NAMES.get(url, "Unknown source")
+                        "source": RSS_SOURCE_NAMES.get(url, "Unknown source"),
+                        "published_at": published_at,
                     }
         except Exception:
             continue
@@ -755,7 +767,11 @@ def run_pipeline_cycle():
     source_meta = state.headline_metadata.get(headline, {})
 
     new_alert = {
-        "Timestamp": datetime.now().strftime("%I:%M:%S %p"),
+        # The article's actual RSS publish time (UTC, ISO 8601) — not when our
+        # pipeline finished analyzing it, which can lag by however long the
+        # headline sat in the filter/analysis queue. The frontend renders
+        # this in the viewer's own local timezone.
+        "Timestamp": source_meta.get("published_at") or datetime.utcnow().isoformat() + "Z",
         "Headline": headline,
         "Summary": ai_blueprint.get("summary"),
         "Sentiment": ai_blueprint.get("sentiment"),
