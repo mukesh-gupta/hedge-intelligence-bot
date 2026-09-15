@@ -28,9 +28,14 @@ YF_CACHE_SECONDS = 60
 BATCH_FILTER_SIZE = 20
 
 TRADE_HISTORY_FILE = "trade_history.json"
-MAX_STORED_ALERTS = 200
+# ~1.1KB/entry observed in practice, so 2000 entries is ~2.2MB — a small
+# fraction of Upstash's free-tier storage, while covering several days of
+# history instead of a few hours. Every save re-uploads the whole list, so
+# this is deliberately bounded rather than unlimited.
+MAX_STORED_ALERTS = 2000
 PROCESSED_HEADLINES_FILE = "processed_headlines.json"
-MAX_STORED_HEADLINES = 500
+# ~70 bytes/entry observed, so 5000 entries is ~350KB.
+MAX_STORED_HEADLINES = 5000
 WATCHLIST_FILE = "watchlist.json"
 DEFAULT_WATCHLIST = [
     {"symbol": "NDAQ", "label": "NDAQ"},
