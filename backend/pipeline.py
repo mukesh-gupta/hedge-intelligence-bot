@@ -27,16 +27,13 @@ AV_MIN_SECONDS_BETWEEN_CALLS = 13
 YF_CACHE_SECONDS = 60
 BATCH_FILTER_SIZE = 20
 
-TRADE_HISTORY_FILE = "trade_history.json"
 # ~1.1KB/entry observed in practice, so 2000 entries is ~2.2MB — a small
 # fraction of Upstash's free-tier storage, while covering several days of
 # history instead of a few hours. Every save re-uploads the whole list, so
 # this is deliberately bounded rather than unlimited.
 MAX_STORED_ALERTS = 2000
-PROCESSED_HEADLINES_FILE = "processed_headlines.json"
 # ~70 bytes/entry observed, so 5000 entries is ~350KB.
 MAX_STORED_HEADLINES = 5000
-WATCHLIST_FILE = "watchlist.json"
 DEFAULT_WATCHLIST = [
     {"symbol": "NDAQ", "label": "NDAQ"},
     {"symbol": "MS", "label": "MS"},
@@ -104,71 +101,32 @@ class PipelineState:
 
 
 def load_trade_history():
-    if storage.is_configured():
-        return storage.redis_get_json("trade_history", [])
-    try:
-        with open(TRADE_HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    return storage.redis_get_json("trade_history", [])
 
 
 def save_trade_history(history):
     trimmed = history[:MAX_STORED_ALERTS]
-    if storage.is_configured():
-        if not storage.redis_set_json("trade_history", trimmed):
-            report_error("Persisting trade history", "Upstash write failed")
-        return
-    try:
-        with open(TRADE_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(trimmed, f)
-    except Exception as e:
-        report_error("Persisting trade history", e)
+    if not storage.redis_set_json("trade_history", trimmed):
+        report_error("Persisting trade history", "Upstash write failed")
 
 
 def load_processed_headlines():
-    if storage.is_configured():
-        return set(storage.redis_get_json("processed_headlines", []))
-    try:
-        with open(PROCESSED_HEADLINES_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
+    return set(storage.redis_get_json("processed_headlines", []))
 
 
 def save_processed_headlines(headlines_set):
     trimmed = list(headlines_set)[-MAX_STORED_HEADLINES:]
-    if storage.is_configured():
-        if not storage.redis_set_json("processed_headlines", trimmed):
-            report_error("Persisting seen-headlines", "Upstash write failed")
-        return
-    try:
-        with open(PROCESSED_HEADLINES_FILE, "w", encoding="utf-8") as f:
-            json.dump(trimmed, f)
-    except Exception as e:
-        report_error("Persisting seen-headlines", e)
+    if not storage.redis_set_json("processed_headlines", trimmed):
+        report_error("Persisting seen-headlines", "Upstash write failed")
 
 
 def load_watchlist():
-    if storage.is_configured():
-        return storage.redis_get_json("watchlist", list(DEFAULT_WATCHLIST))
-    try:
-        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return list(DEFAULT_WATCHLIST)
+    return storage.redis_get_json("watchlist", list(DEFAULT_WATCHLIST))
 
 
 def save_watchlist(watchlist):
-    if storage.is_configured():
-        if not storage.redis_set_json("watchlist", watchlist):
-            report_error("Persisting watchlist", "Upstash write failed")
-        return
-    try:
-        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(watchlist, f)
-    except Exception as e:
-        report_error("Persisting watchlist", e)
+    if not storage.redis_set_json("watchlist", watchlist):
+        report_error("Persisting watchlist", "Upstash write failed")
 
 
 def report_error(source, message):
