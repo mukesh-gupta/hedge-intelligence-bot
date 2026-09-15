@@ -1,19 +1,28 @@
+import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from backend import pipeline, scheduler
+from backend import pipeline, scheduler, realtime
+
+_realtime_task = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _realtime_task
     scheduler.start()
+    _realtime_task = asyncio.create_task(realtime.store.run())
     yield
     scheduler.stop()
+    if _realtime_task is not None:
+        _realtime_task.cancel()
 
 
 app = FastAPI(title="Hedge Intelligence Terminal API", lifespan=lifespan)
@@ -125,13 +134,50 @@ def post_watchlist(body: WatchlistAddRequest):
     # Mutations are rare, user-initiated, and expected to reflect immediately — unlike the
     # GET above, it's fine for this one to do a real (small, ~10-symbol) live fetch inline
     # rather than waiting for the next scheduled warm cycle.
-    return {"watchlist": pipeline.refresh_watchlist_cache()}
+    result = {"watchlist": pipeline.refresh_watchlist_cache()}
+    realtime.store.resubscribe_from_any_thread()
+    return result
 
 
 @app.delete("/api/watchlist/{symbol}")
 def delete_watchlist(symbol: str):
     pipeline.remove_from_watchlist(symbol)
-    return {"watchlist": pipeline.refresh_watchlist_cache()}
+    result = {"watchlist": pipeline.refresh_watchlist_cache()}
+    realtime.store.resubscribe_from_any_thread()
+    return result
+
+
+@app.get("/api/watchlist/stream")
+async def stream_watchlist(request: Request):
+    """Server-Sent Events: pushes a {symbol, price, t} update the instant a
+    Finnhub trade tick arrives for any watchlist symbol, instead of the
+    client having to poll. Symbols with no live feed (indices, uncommon
+    futures) simply never emit here — the REST endpoint above remains the
+    source of truth for those."""
+
+    async def event_stream():
+        queue = realtime.store.add_subscriber()
+        try:
+            # Replay whatever we already know so a client that connects between
+            # ticks isn't stuck waiting for the next one to see current prices.
+            for update in realtime.store.latest.values():
+                yield f"data: {json.dumps(update)}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    update = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield f"data: {json.dumps(update)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            realtime.store.remove_subscriber(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/settings")

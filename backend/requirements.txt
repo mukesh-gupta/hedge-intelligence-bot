@@ -7,3 +7,4 @@ feedparser
 requests
 python-dotenv
 pandas
+websockets
