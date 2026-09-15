@@ -141,7 +141,7 @@ state = PipelineState()
 
 def call_llm(prompt, temperature=0.0):
     """Try Groq first; if it genuinely fails (e.g. daily quota exhausted), fall back to
-    OpenRouter, then Gemini. Returns None only if all three fail. No max_tokens cap —
+    Gemini, then OpenRouter. Returns None only if all three fail. No max_tokens cap —
     Groq's gpt-oss-120b is a reasoning model that spends a large, variable amount of its
     budget on hidden internal reasoning before writing the visible answer; capping output
     length caused it to hit the limit mid-thought and return empty responses."""
@@ -160,22 +160,6 @@ def call_llm(prompt, temperature=0.0):
     except Exception as e:
         report_error("Groq", e)
 
-    if OPENROUTER_API_KEY:
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
-                timeout=20
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("usage"):
-                state.openrouter_tokens_today += payload["usage"].get("total_tokens", 0)
-            return payload["choices"][0]["message"]["content"].strip()
-        except Exception as e2:
-            report_error("OpenRouter fallback", e2)
-
     if GEMINI_API_KEY:
         try:
             response = requests.post(
@@ -193,8 +177,24 @@ def call_llm(prompt, temperature=0.0):
             if usage:
                 state.gemini_tokens_today += usage.get("totalTokenCount", 0)
             return payload["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e2:
+            report_error("Gemini fallback", e2)
+
+    if OPENROUTER_API_KEY:
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
+                timeout=20
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("usage"):
+                state.openrouter_tokens_today += payload["usage"].get("total_tokens", 0)
+            return payload["choices"][0]["message"]["content"].strip()
         except Exception as e3:
-            report_error("Gemini fallback", e3)
+            report_error("OpenRouter fallback", e3)
 
     state.ai_unavailable_until = time.time() + AI_COOLDOWN_SECONDS
     print(f"[pipeline] All AI providers unavailable — pausing analysis for {AI_COOLDOWN_SECONDS}s")
