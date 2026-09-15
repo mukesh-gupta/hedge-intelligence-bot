@@ -11,6 +11,8 @@ import yfinance as yf
 from dotenv import load_dotenv
 from groq import Groq
 
+from backend import storage
+
 load_dotenv()
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=15.0, max_retries=1)
@@ -97,6 +99,8 @@ class PipelineState:
 
 
 def load_trade_history():
+    if storage.is_configured():
+        return storage.redis_get_json("trade_history", [])
     try:
         with open(TRADE_HISTORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -105,14 +109,21 @@ def load_trade_history():
 
 
 def save_trade_history(history):
+    trimmed = history[:MAX_STORED_ALERTS]
+    if storage.is_configured():
+        if not storage.redis_set_json("trade_history", trimmed):
+            report_error("Persisting trade history", "Upstash write failed")
+        return
     try:
         with open(TRADE_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history[:MAX_STORED_ALERTS], f)
+            json.dump(trimmed, f)
     except Exception as e:
         report_error("Persisting trade history", e)
 
 
 def load_processed_headlines():
+    if storage.is_configured():
+        return set(storage.redis_get_json("processed_headlines", []))
     try:
         with open(PROCESSED_HEADLINES_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
@@ -121,8 +132,12 @@ def load_processed_headlines():
 
 
 def save_processed_headlines(headlines_set):
+    trimmed = list(headlines_set)[-MAX_STORED_HEADLINES:]
+    if storage.is_configured():
+        if not storage.redis_set_json("processed_headlines", trimmed):
+            report_error("Persisting seen-headlines", "Upstash write failed")
+        return
     try:
-        trimmed = list(headlines_set)[-MAX_STORED_HEADLINES:]
         with open(PROCESSED_HEADLINES_FILE, "w", encoding="utf-8") as f:
             json.dump(trimmed, f)
     except Exception as e:
@@ -130,6 +145,8 @@ def save_processed_headlines(headlines_set):
 
 
 def load_watchlist():
+    if storage.is_configured():
+        return storage.redis_get_json("watchlist", list(DEFAULT_WATCHLIST))
     try:
         with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -138,6 +155,10 @@ def load_watchlist():
 
 
 def save_watchlist(watchlist):
+    if storage.is_configured():
+        if not storage.redis_set_json("watchlist", watchlist):
+            report_error("Persisting watchlist", "Upstash write failed")
+        return
     try:
         with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
             json.dump(watchlist, f)
