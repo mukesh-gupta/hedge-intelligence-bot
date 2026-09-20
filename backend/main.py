@@ -130,7 +130,10 @@ class WatchlistAddRequest(BaseModel):
 
 @app.post("/api/watchlist")
 def post_watchlist(body: WatchlistAddRequest):
-    pipeline.add_to_watchlist(body.symbol, body.label)
+    try:
+        pipeline.add_to_watchlist(body.symbol, body.label)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     # Mutations are rare, user-initiated, and expected to reflect immediately — unlike the
     # GET above, it's fine for this one to do a real (small, ~10-symbol) live fetch inline
     # rather than waiting for the next scheduled warm cycle.

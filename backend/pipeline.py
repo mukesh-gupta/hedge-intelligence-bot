@@ -949,9 +949,16 @@ def fetch_sector_performance(timeframe="1D"):
 
 # --- WATCHLIST ---
 def add_to_watchlist(symbol, label=None):
+    """Raises ValueError if the symbol doesn't resolve to real yfinance data — without
+    this check, a bad symbol (e.g. a company name an AI ripple-effect guess produced that
+    isn't an actual traded ticker, like "SPACEX" instead of its real SPAC ticker "SPCX")
+    would sit on the watchlist forever, failing on every single warm cycle and flooding
+    the logs with "No data found, symbol may be delisted" indefinitely."""
     symbol = symbol.strip().upper()
     if any(w["symbol"] == symbol for w in state.watchlist):
         return state.watchlist
+    if fetch_market_data_yf(symbol) is None:
+        raise ValueError(f"'{symbol}' does not resolve to a real, tradeable yfinance symbol")
     state.watchlist.append({"symbol": symbol, "label": label or symbol})
     save_watchlist(state.watchlist)
     return state.watchlist
