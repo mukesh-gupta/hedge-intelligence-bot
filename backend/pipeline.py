@@ -1,3 +1,4 @@
+import collections
 import concurrent.futures
 import gc
 import itertools
@@ -5,7 +6,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import feedparser
 import requests
@@ -17,28 +18,68 @@ from backend import storage
 
 load_dotenv()
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=15.0, max_retries=1)
+# No SDK retries: a 429 should fall straight through to the next model in the chain
+# rather than sleep and retry a model whose daily allowance is already spent.
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=15.0, max_retries=0)
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+
+# Everything runs on free tiers. Groq's free tier gives each model its own daily allowance
+# (200K tokens/day each — checked live: 120b returned 429 while 20b kept answering), so each
+# pipeline stage gets its own model instead of every stage draining one shared pool.
+GROQ_FAST_MODEL = "openai/gpt-oss-20b"
+GROQ_DEEP_MODEL = "openai/gpt-oss-120b"
+GROQ_BACKUP_MODEL = "qwen/qwen3.8-27b"  # no hidden reasoning, so very few tokens per call
+GROQ_DAILY_TOKEN_LIMIT = 200_000
+AI_TIERS = {
+    # Triage: scores ~20 headlines per call. Measured ~1.1K tokens per batch on 20b at low effort.
+    "fast": [(GROQ_FAST_MODEL, {"reasoning_effort": "low"}), (GROQ_BACKUP_MODEL, {}), (GROQ_DEEP_MODEL, {"reasoning_effort": "low"})],
+    # Deep analysis, only for high-impact headlines.
+    "deep": [(GROQ_DEEP_MODEL, {}), (GROQ_BACKUP_MODEL, {}), (GROQ_FAST_MODEL, {})],
+}
+# Triage impact scores (1-10): below QUICK the headline is dropped; from QUICK up it becomes
+# a quick signal straight from the triage answer (no extra AI call); from DEEP up it gets a
+# full deep analysis. DEEP rises to DEEP_IMPACT_WHEN_LOW_BUDGET once the deep model has used
+# most of its daily allowance, so what's left goes to the biggest news.
+QUICK_SIGNAL_MIN_IMPACT = 5
+DEEP_ANALYSIS_MIN_IMPACT = 7
+DEEP_IMPACT_WHEN_LOW_BUDGET = 9
+LOW_BUDGET_FRACTION = 0.8
 
 AI_COOLDOWN_SECONDS = 90
 AV_MIN_SECONDS_BETWEEN_CALLS = 13
 YF_CACHE_SECONDS = 60
 BATCH_FILTER_SIZE = 20
 
-# ~1.1KB/entry observed in practice, so 2000 entries is ~2.2MB — a small
-# fraction of Upstash's free-tier storage, while covering several days of
-# history instead of a few hours. Every save re-uploads the whole list, so
-# this is deliberately bounded rather than unlimited.
+# ~1.1KB/entry observed in practice, so 2000 entries is ~2.2MB. Stored as a Redis list so a
+# new signal is one small LPUSH, not a re-upload of the whole history — at a few hundred
+# signals a day, full re-uploads alone would exceed Upstash's free 10GB/month bandwidth.
+SIGNALS_KEY = "signals"
 MAX_STORED_ALERTS = 2000
 # ~70 bytes/entry observed, so 5000 entries is ~350KB.
 MAX_STORED_HEADLINES = 5000
 # Metadata is only needed until a headline is analyzed; ones the filter rejects would
 # otherwise linger forever.
-MAX_HEADLINE_METADATA = 500
+MAX_HEADLINE_METADATA = 1000
+# News older than this is already priced in — skipped at ingestion, and dropped from the
+# queues if it ages past this while waiting for analysis.
+MAX_HEADLINE_AGE_MINUTES = 60
+# Newest-first cap on the unfiltered queue, so a long AI outage can't grow it without bound.
+MAX_PENDING_HEADLINES = 300
+FEED_TIMEOUT_SECONDS = 8
+FEED_FETCH_WORKERS = 10
+# Seen-headline markers change on nearly every scan; re-uploading the whole set each time
+# would cost far more Upstash bandwidth than it's worth. Losing a few minutes of markers on
+# a restart is harmless — MAX_HEADLINE_AGE_MINUTES already stops old news being re-analyzed.
+HEADLINES_SAVE_INTERVAL_SECONDS = 300
+# Same story syndicated by several outlets with reworded titles: treated as a duplicate when
+# this share of meaningful words overlaps with a story already accepted in the window.
+DEDUP_SIMILARITY = 0.5
+DEDUP_WINDOW_SECONDS = 6 * 3600
 # Signals and seen-headlines older than this are deleted from memory and Upstash. Checked
 # once a day (and at startup), so data is gone within a day of turning 7 days old.
 RETENTION_DAYS = 7
@@ -71,18 +112,23 @@ class PipelineState:
         self.groq_tokens_today = 0
         self.openrouter_tokens_today = 0
         self.gemini_tokens_today = 0
+        self.model_tokens_today = {}
         self.av_calls_today = 0
+        self.av_exhausted = False
         self.market_data_cache = {}
         self.symbol_cache = {}
         self.last_av_call_time = 0
 
         self.last_error = None
+        self.recent_errors = collections.deque(maxlen=50)  # newest last; served by /api/errors
         self.ai_unavailable_until = 0
+        self.model_unavailable_until = {}  # model/provider -> epoch when its rate limit lifts
         self.last_scan_time = 0
+        self.headlines_saved_at = 0
 
         # Runtime-adjustable settings — mutable via PATCH /api/settings instead of being
         # fixed constants, so the React Settings screen can actually control the scheduler.
-        self.refresh_interval_seconds = 30
+        self.refresh_interval_seconds = 20
         self.active = True
 
         self.watchlist = load_watchlist()
@@ -103,7 +149,9 @@ class PipelineState:
             self.groq_tokens_today = 0
             self.openrouter_tokens_today = 0
             self.gemini_tokens_today = 0
+            self.model_tokens_today = {}
             self.av_calls_today = 0
+            self.av_exhausted = False
             self.market_data_cache = {}
             self.symbol_cache = {}
             prune_old_data()
@@ -126,7 +174,7 @@ def prune_old_data():
     if len(kept_alerts) != len(state.trade_history):
         removed = len(state.trade_history) - len(kept_alerts)
         state.trade_history = kept_alerts
-        save_trade_history(kept_alerts)
+        replace_trade_history(kept_alerts)
         print(f"[pipeline] Pruned {removed} signals older than {RETENTION_DAYS} days")
 
     cutoff_epoch = time.time() - RETENTION_DAYS * 86400
@@ -139,12 +187,33 @@ def prune_old_data():
 
 
 def load_trade_history():
-    return storage.redis_get_json("trade_history", [])
+    """Signals, newest first, from the Redis list. On the first run after the switch to a
+    list, copies them over from the old single-JSON key (which is left in place, untouched)."""
+    replies = storage.redis_pipeline([["LRANGE", SIGNALS_KEY, 0, -1]])
+    if replies is None:
+        return []  # Upstash not configured or unreachable: behave like a cold start
+    if replies[0]:
+        return [json.loads(item) for item in replies[0]]
+    legacy = storage.redis_get_json("trade_history", [])[:MAX_STORED_ALERTS]
+    if legacy and storage.redis_pipeline([["RPUSH", SIGNALS_KEY, *[json.dumps(a) for a in legacy]]]) is None:
+        print("[pipeline] Copying signals to the Redis list failed; will retry next start")
+    return legacy
 
 
-def save_trade_history(history):
-    trimmed = history[:MAX_STORED_ALERTS]
-    if not storage.redis_set_json("trade_history", trimmed):
+def append_signal(alert):
+    if storage.redis_pipeline([
+        ["LPUSH", SIGNALS_KEY, json.dumps(alert)],
+        ["LTRIM", SIGNALS_KEY, 0, MAX_STORED_ALERTS - 1],
+    ]) is None:
+        report_error("Persisting signal", "Upstash write failed")
+
+
+def replace_trade_history(history):
+    """Full rewrite — only for the once-a-day retention prune, never per signal."""
+    commands = [["DEL", SIGNALS_KEY]]
+    if history:
+        commands.append(["RPUSH", SIGNALS_KEY, *[json.dumps(a) for a in history[:MAX_STORED_ALERTS]]])
+    if storage.redis_pipeline(commands) is None:
         report_error("Persisting trade history", "Upstash write failed")
 
 
@@ -160,7 +229,12 @@ def load_processed_headlines():
 
 
 def save_processed_headlines(headlines):
-    trimmed = dict(itertools.islice(headlines.items(), max(0, len(headlines) - MAX_STORED_HEADLINES), None))
+    """Persists only markers from the last two freshness windows: anything older is skipped
+    by the MAX_HEADLINE_AGE_MINUTES check anyway, and re-uploading days of markers every few
+    minutes would use up a large share of Upstash's free 10GB/month bandwidth."""
+    cutoff = time.time() - 2 * MAX_HEADLINE_AGE_MINUTES * 60
+    recent = [(title, seen) for title, seen in headlines.items() if seen >= cutoff]
+    trimmed = dict(recent[-MAX_STORED_HEADLINES:])
     if not storage.redis_set_json("processed_headlines", trimmed):
         report_error("Persisting seen-headlines", "Upstash write failed")
 
@@ -178,35 +252,85 @@ def report_error(source, message):
     """Record the failure on shared state instead of firing a Streamlit toast —
     the API layer surfaces this via GET /api/status."""
     state.last_error = {"source": source, "message": str(message)[:300], "time": datetime.now().strftime("%I:%M:%S %p")}
+    state.recent_errors.append({**state.last_error, "at": datetime.utcnow().isoformat() + "Z"})
     print(f"[pipeline] {source} error: {str(message)[:200]}")
+
+
+def process_memory_mb():
+    """Resident memory of this process, read from /proc (Linux, i.e. Render) — the number
+    that matters against the free plan's 512MB limit. None where /proc isn't available."""
+    try:
+        with open("/proc/self/statm") as f:
+            return round(int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024, 1)
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 state = PipelineState()
 prune_old_data()
 
 
-def call_llm(prompt, temperature=0.0):
-    """Try Groq first; if it genuinely fails (e.g. daily quota exhausted), fall back to
-    Gemini, then OpenRouter. Returns None only if all three fail. No max_tokens cap —
-    Groq's gpt-oss-120b is a reasoning model that spends a large, variable amount of its
-    budget on hidden internal reasoning before writing the visible answer; capping output
-    length caused it to hit the limit mid-thought and return empty responses."""
+def _retry_after_seconds(error, default=60):
+    """Seconds until a rate limit lifts, from Groq's 429 text ("Please try again in 7m12.5s")."""
+    match = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", str(error))
+    if not match or not any(match.groups()):
+        return default
+    hours, minutes, seconds = match.groups()
+    return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds or 0)
+
+
+def _provider_available(name):
+    return time.time() >= state.model_unavailable_until.get(name, 0)
+
+
+def _mark_unavailable(name, error, status_code):
+    """Rate-limited (429): skip this model/provider until its limit lifts. Any other failure
+    (timeout, 5xx): skip it briefly so one flaky provider doesn't slow every call."""
+    cooldown = _retry_after_seconds(error, default=600) if status_code == 429 else 30
+    state.model_unavailable_until[name] = time.time() + cooldown
+
+
+def deep_impact_threshold():
+    """Impact score a headline needs for a full deep analysis. Raised once the deep model
+    has used most of its free daily allowance (or is rate-limited), so the remaining quota
+    goes to the biggest news instead of running out on routine stories."""
+    used = state.model_tokens_today.get(GROQ_DEEP_MODEL, 0)
+    if used >= LOW_BUDGET_FRACTION * GROQ_DAILY_TOKEN_LIMIT or not _provider_available(GROQ_DEEP_MODEL):
+        return DEEP_IMPACT_WHEN_LOW_BUDGET
+    return DEEP_ANALYSIS_MIN_IMPACT
+
+
+def call_llm(prompt, tier="deep", temperature=0.0):
+    """Tries the tier's Groq models in order (each has its own free daily allowance), then
+    Gemini, then OpenRouter. A model that hits its rate limit is skipped until the limit
+    lifts instead of being retried on every call. Returns None only if all are unavailable.
+    No max_tokens cap — gpt-oss models spend a large, variable amount of their budget on
+    hidden reasoning before the visible answer; capping output length caused them to hit
+    the limit mid-thought and return empty responses."""
     if time.time() < state.ai_unavailable_until:
         return None
 
-    try:
-        completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature
-        )
-        if completion.usage:
-            state.groq_tokens_today += completion.usage.total_tokens
-        return completion.choices[0].message.content.strip()
-    except Exception as e:
-        report_error("Groq", e)
+    for model, extra_params in AI_TIERS[tier]:
+        if not _provider_available(model):
+            continue
+        try:
+            completion = groq_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                **extra_params,
+            )
+            tokens = completion.usage.total_tokens if completion.usage else 0
+            state.groq_tokens_today += tokens
+            state.model_tokens_today[model] = state.model_tokens_today.get(model, 0) + tokens
+            content = (completion.choices[0].message.content or "").strip()
+            if content:
+                return content
+        except Exception as e:
+            report_error(f"Groq {model}", e)
+            _mark_unavailable(model, e, getattr(e, "status_code", None))
 
-    if GEMINI_API_KEY:
+    if GEMINI_API_KEY and _provider_available("gemini"):
         try:
             response = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
@@ -225,8 +349,10 @@ def call_llm(prompt, temperature=0.0):
             return payload["candidates"][0]["content"]["parts"][0]["text"].strip()
         except Exception as e2:
             report_error("Gemini fallback", e2)
+            _mark_unavailable("gemini", e2, getattr(getattr(e2, "response", None), "status_code", None))
 
-    if OPENROUTER_API_KEY:
+    # Free OpenRouter models allow only 50 requests/day, so this is a last resort.
+    if OPENROUTER_API_KEY and _provider_available("openrouter"):
         try:
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -241,102 +367,204 @@ def call_llm(prompt, temperature=0.0):
             return payload["choices"][0]["message"]["content"].strip()
         except Exception as e3:
             report_error("OpenRouter fallback", e3)
+            _mark_unavailable("openrouter", e3, getattr(getattr(e3, "response", None), "status_code", None))
 
     state.ai_unavailable_until = time.time() + AI_COOLDOWN_SECONDS
     print(f"[pipeline] All AI providers unavailable — pausing analysis for {AI_COOLDOWN_SECONDS}s")
     return None
 
 
+def _word_regex(fragments):
+    """Case-insensitive whole-word matcher for a list of regex fragments, each allowed a
+    trailing plural "s"/"es". Whole-word matters: plain substring checks let "rate" match
+    "corporate", "war" match "software", "nse" match "response" and "gold" match "Goldman"."""
+    alternation = "|".join(f"(?:{f})" for f in fragments)
+    return re.compile(rf"(?<![a-z0-9])(?:{alternation})(?:e?s)?(?![a-z0-9])", re.IGNORECASE)
+
+
+# Regex fragments, matched as whole words (see _word_regex). Deliberately broad — this is
+# only the cheap first gate; the AI batch filter makes the final market-moving call.
 MARKET_RELEVANCE_KEYWORDS = [
-    "stock", "share", "market", "index", "nasdaq", "s&p", "dow jones", "sensex", "nifty",
-    "bank nifty", "banknifty", "f&o", "futures and options", "nse", "bse",
-    "fed", "rate", "inflation", "gdp", "earnings", "ipo", "merger", "acquisition",
-    "oil", "gold", "silver", "copper", "commodity", "crude", "opec", "gas",
-    "crypto", "bitcoin", "currency", "dollar", "yen", "yuan", "euro",
-    "tariff", "trade war", "sanctions", "central bank", "treasury", "bond", "yield",
-    "recession", "selloff", "sell-off", "rally", "surge", "plunge", "slump", "crash",
-    "ceo", "bankruptcy", "layoff", "tech stock",
-    "chip", "semiconductor", "ai ", "gpu", "cpu", "foundry", "chipmaker", "fab",
-    "memory chip", "dram", "nand", "hbm", "storage", "data center", "datacenter",
-    "cloud", "server", "nvidia", "tsmc", "asml",
-    "war", "conflict", "military", "missile", "strike", "invasion", "attack",
-    "hormuz", "strait", "geopolitical", "diplomacy", "ceasefire", "troops", "sanction",
-    "renewable", "solar", "wind turbine", "nuclear", "uranium", "coal", "lng",
-    "pipeline", "refinery", "power grid", "electricity", "battery", "lithium",
-    "cobalt", "rare earth", "ev ", "electric vehicle", "automaker",
-    "mining", "iron ore", "steel", "zinc", "nickel", "aluminum",
-    "soybean", "cocoa", "livestock", "crop", "harvest", "farm subsidy",
-    "drug", "fda", "vaccine", "clinical trial", "biotech", "pharma",
-    "housing", "mortgage", "real estate", "construction", "homebuilder",
-    "5g", "spectrum", "telecom", "broadband",
-    "retail sales", "consumer spending", "e-commerce"
+    # Markets and price moves
+    "stock", "share", r"equit(?:y|ies)", "market", "index", "indices", "nasdaq", r"s&p", "dow",
+    "dow jones", "wall street", "ftse", "dax", "cac", "stoxx", "nikkei", "topix", "hang seng",
+    "kospi", "shanghai composite", "csi 300", "asx", "msci", "futures", "etf", "ipo", "listing",
+    r"delist(?:ed|ing)?", r"short[- ]sell(?:er|ing)?", "volatility", "vix", "bull market",
+    "bear market", "correction", "record high", "all-time high", "52-week", "investor", "trader",
+    "trading", "hedge fund", "fund", "valuation", "market cap", r"rall(?:y|ies|ied|ying)",
+    r"surg(?:e|ed|ing)", r"plung(?:e|ed|ing)", r"slump(?:ed|ing)?", r"crash(?:ed|ing)?",
+    r"tumbl(?:e|ed|ing)", r"soar(?:ed|ing)?", r"jump(?:ed|ing)?", r"sink(?:ing)?", "sank",
+    r"slid(?:e|ing)?", r"sell-?off", "rout", r"rebound(?:ed|ing)?",
+    # Macro, rates and central banks
+    "fed", "federal reserve", "fomc", "powell", "central bank", "ecb", "lagarde", "boj",
+    "bank of japan", "ueda", "boe", "bank of england", "pboc", "snb", "rba", "bank of canada",
+    "rbi", "monetary policy", "mpc", "rate", "repo rate", "interest rate", "rate cut", "rate hike",
+    "hike", "inflation", "deflation", "disinflation", "cpi", "ppi", "pce", "gdp", "payroll",
+    "nonfarm", "jobs report", "jobs data", "jobless", "unemployment", "job openings", "jolts",
+    "pmi", "ism", "retail sales", "consumer spending", "consumer confidence", "consumer sentiment",
+    "industrial output", "factory", "manufacturing", "recession", "slowdown", "stimulus",
+    "treasury", "treasuries", "bond", "yield", "gilt", "bund", "jgb", "debt", "deficit", "fiscal",
+    "budget", r"tax(?:es)?", "tariff", "trade war", "trade deal", "trade talks", "export", "import",
+    "sanction", "embargo", "shutdown", "debt ceiling", "imf", "world bank", "economy", "economic",
+    "growth",
+    # Company events
+    r"earning", "revenue", "sales", "profit", "net loss", "quarterly", r"q[1-4]", r"fy\d{2,4}",
+    "results", "guidance", "forecast", "outlook", "estimate", "expectation", "consensus",
+    "merger", "acquisition", r"acquir(?:e|ed|ing)", "takeover", "buyout", "deal", "stake", "bid",
+    "buyback", "share repurchase", "dividend", "stock split", r"spin-?off", "demerger",
+    r"bankrupt(?:cy)?", "chapter 11", "default", "insolvency", "layoff", "job cuts",
+    r"restructur(?:e|ed|ing)", "ceo", "cfo", r"downgrad(?:e|ed|ing)", r"upgrad(?:e|ed|ing)",
+    "price target", "credit rating", "moody's", "fitch", r"halt(?:ed|ing)?", "recall", "antitrust",
+    "lawsuit", "probe", "investigation", "fined", "penalty", "sec", "ftc", "doj", "regulator",
+    # India
+    "sensex", "nifty", "bank nifty", "banknifty", "nifty bank", "gift nifty", "nse", "bse", "sebi",
+    "dalal street", "d-street", "rupee", "fii", "fpi", "dii", r"f&o", "futures and options",
+    "mutual fund", "amfi", "crore", "lakh crore", "gst", "union budget", "monsoon", "mcx",
+    # Commodities
+    r"commodit(?:y|ies)", "oil", "crude", "brent", "wti", r"opec\+?", "natural gas", "gas", "lng",
+    "gasoline", "diesel", "fuel", r"refiner(?:y|ies)?", "pipeline", "gold", "silver", "platinum",
+    "palladium", "bullion", "precious metal", "copper", r"alumin(?:um|ium)", "zinc", "nickel",
+    "iron ore", "steel", "coal", "lithium", "cobalt", "uranium", "rare earth", "metal", "mining",
+    "miner", "wheat", "corn", "soybean", "soy", "rice", "sugar", "coffee", "cocoa", "cotton",
+    "palm oil", "edible oil", "grain", "crop", "harvest", r"fertili[sz]er", "livestock", "cattle",
+    "comex", "nymex", "lme", "cbot",
+    # Forex and crypto
+    "dollar", "dxy", "greenback", "euro", "yen", "yuan", "renminbi", "pound", "sterling", "franc",
+    "peso", "lira", "rupiah", "forex", "fx", r"currenc(?:y|ies)", r"devalu(?:e|ed|ation)", "crypto",
+    r"cryptocurrenc(?:y|ies)", "bitcoin", "btc", "ether", "ethereum", "stablecoin", "solana", "xrp",
+    "binance", "coinbase", "tether", "blockchain",
+    # Geopolitics
+    "war", "conflict", "military", "missile", "airstrike", "strike", "invasion", "attack", "troops",
+    "ceasefire", "truce", "nuclear", "hormuz", "red sea", "houthi", "strait", r"geopolitic(?:s|al)",
+    "coup", "election", "blockade", "drone",
+    # Sectors and technology
+    "semiconductor", "chip", "chipmaker", "gpu", "cpu", "foundry", "fab", "dram", "nand", "hbm",
+    "memory chip", "ai", "artificial intelligence", r"data cent(?:er|re)", "datacenter", "cloud",
+    "server", "ev", "electric vehicle", "automaker", "carmaker", "battery", "solar", "renewable",
+    "wind power", "power grid", "electricity", r"utilit(?:y|ies)", "pharma", "biotech", "drugmaker",
+    "drug", "fda", "vaccine", "clinical trial", "housing", "mortgage", "home sales", "real estate",
+    "homebuilder", "airline", "telecom", "5g", "spectrum", "broadband", "bank", "lender", "insurer",
+    "e-commerce", "retailer", "retail",
+    # Market-moving companies (US / global)
+    "apple", "microsoft", "nvidia", "amazon", "alphabet", "google", "meta", "tesla", "broadcom",
+    "berkshire", "jpmorgan", "goldman", "goldman sachs", "morgan stanley", r"citi(?:group)?",
+    "wells fargo", "bank of america", "netflix", "intel", "amd", "micron", "qualcomm", "oracle",
+    "salesforce", "palantir", "boeing", "exxon", "chevron", "walmart", "costco", "pfizer",
+    "eli lilly", "novo nordisk", "unitedhealth", "openai", "anthropic", "tsmc", "samsung",
+    "sk hynix", "asml", "alibaba", "tencent", "byd", "toyota", "sony", "softbank", "aramco",
+    "shell", "bp", "lvmh", "nestle", "hsbc", "ubs",
+    # Market-moving companies (India)
+    "reliance", "tcs", "infosys", "wipro", "hcl tech", "hdfc", "icici", "sbi", "kotak",
+    "axis bank", "adani", "tata", "bajaj", "mahindra", "maruti", "airtel", "itc", r"l&t", "larsen",
+    "ongc", "coal india", "ntpc", "vedanta", "zomato", "paytm", "lic", "hindustan unilever",
+    "sun pharma", "jio",
 ]
+MARKET_KEYWORD_REGEX = _word_regex(MARKET_RELEVANCE_KEYWORDS)
+
+# Headlines that mention market words but are never market-moving news: commentary,
+# listicles, explainers, previews, live blogs and personal-finance content.
+NOISE_REGEX = re.compile("|".join([
+    r"\?\s*$",  # "Why Did X Stock Jump?", "Will the S&P Open Up?" — commentary, not news
+    r"^how to\b",
+    r"\bstocks? to (?:buy|watch|sell|avoid|own)\b",
+    r"\b(?:best|top \d+) (?:stocks|shares|etfs|funds|picks)\b",
+    r"\b\d+ (?:\w+ )?(?:stocks|etfs|shares|funds) (?:to|that|for|with)\b",
+    r"\bwhat to (?:know|expect|watch)\b",
+    r"\b(?:things|need) to know\b",
+    r"\bhere['’]?s (?:why|what|how|the)\b",
+    r"\bcramer\b",
+    r"\bmotley fool\b",
+    r"\((?:video|podcast|audio)\)",
+    r"\bpodcast\b",
+    r"\bnewsletter\b",
+    r"\bopinion\b",
+    r"\bexplain(?:ed|er)\b",
+    r"\bexplains (?:why|how|what)\b",
+    # Daily local price-list pages ("Gold Rate Today in Katni", "Gold price in Pakistan for today")
+    r"\b(?:rates?|prices?) today\b",
+    r"\bprices? in [\w ]+ for today\b",
+    r"\bquiz\b",
+    r"\bweek ahead\b",
+    r"\blive(?: updates| blog)?:",
+    r"\blive updates\b",
+    r"\bmorning bid\b",
+    r"\b(?:credit cards?|savings accounts?|cd rates?|personal loans?|mortgage rates today)\b",
+    r"\bretirement (?:savings|plans?|accounts?)\b",
+    r"\bhoroscope\b",
+    r"\bsponsored\b",
+    r"\breview & preview\b",
+]), re.IGNORECASE)
 
 
-def passes_keyword_prefilter(headline):
-    lower = headline.lower()
-    return any(keyword in lower for keyword in MARKET_RELEVANCE_KEYWORDS)
+def is_market_relevant(headline):
+    if NOISE_REGEX.search(headline):
+        return False
+    if MARKET_KEYWORD_REGEX.search(headline):
+        return True
+    # Watchlist tickers count too, matched case-sensitively so a symbol like "ICE" only hits
+    # the ticker, not the word "ice".
+    return any(
+        re.search(rf"(?<![A-Za-z0-9]){re.escape(w['symbol'])}(?![A-Za-z0-9])", headline)
+        for w in state.watchlist
+        if len(w["symbol"]) >= 3 and w["symbol"].isalpha()
+    )
 
 
-def run_groq_filter_batch(headlines):
-    headlines = [h for h in headlines if passes_keyword_prefilter(h)]
+def triage_headlines(headlines):
+    """One cheap AI call scores a whole batch. Returns {headline: {"impact", "direction",
+    "tickers", "sector"}} for headlines scoring at least QUICK_SIGNAL_MIN_IMPACT ({} if none
+    do), or None if every AI provider is unavailable — so the caller can requeue the batch."""
     if not headlines:
-        return []
+        return {}
     numbered = "\n".join(f"{i + 1}. {h}" for i, h in enumerate(headlines))
-    prompt = f"""Below are {len(headlines)} news headlines. For each one, decide if it would
-likely move a stock price, sector, index, or commodity today (a market selloff/rally, a major
-company shock, a central bank decision, a geopolitical event affecting markets, a big earnings
-surprise). Ignore purely personal-finance advice, opinion/listicle content, or routine analyst notes.
+    prompt = f"""Below are {len(headlines)} news headlines from global, Indian, commodity, forex and
+crypto news feeds. Score each one for how much it is likely to move a stock, sector, index,
+currency, bond yield, commodity or crypto price today. Indian market news (Sensex/Nifty, RBI,
+SEBI, the rupee, large Indian companies) counts just as much as US news.
+
+impact (1-10): 10 = market-wide shock (surprise central bank move, war escalation, crash);
+8-9 = major move for a large company, sector, commodity or currency (earnings/guidance surprise,
+big M&A, regulatory action, supply shock); 6-7 = clear but limited price impact; 4-5 = minor.
+Opinion/commentary, personal-finance advice, listicles, previews of scheduled events with no new
+information, recaps of moves with no new cause, and news with no plausible price impact score 1-3.
 
 {numbered}
 
-Respond with ONLY the numbers of the headlines that qualify, comma-separated, nothing else.
-If none qualify, respond with exactly: NONE"""
-    raw_text = call_llm(prompt)
-    if raw_text is None or raw_text.strip().upper() == "NONE":
-        return []
-    try:
-        numbers = [int(n) for n in re.findall(r"\d+", raw_text)]
-        return [headlines[n - 1] for n in numbers if 1 <= n <= len(headlines)]
-    except Exception as e:
-        report_error("Batch filter (parse)", e)
-        return []
-
-
-def analyze_ripple_effect(headline):
-    prompt = f"""
-    Headline: "{headline}"
-    Identify the single market sector and company/ticker most directly and immediately impacted (the "primary" pick).
-    Prefer a specific, real company or stock (e.g. Oracle, ORCL, Reliance Industries) over a broad index or
-    commodity ETF (e.g. avoid SPY, QQQ, GLD, USO) unless the headline is genuinely only about a broad
-    index/commodity with no specific company angle at all.
-    Then list up to 4 additional related plays that could ripple from this news across the supply chain,
-    commodities, or global markets (e.g. a chip-demand headline might ripple to memory makers, storage,
-    data-center operators, power/utilities, or relevant commodities) — again preferring specific companies
-    over broad ETFs. For each, give a direction. Keep it compact — names/tickers only, no explanations.
-    Respond strictly as JSON, nothing else:
-    {{
-        "sector": "Sector name",
-        "primary_ticker": "Best guess company name or symbol",
-        "ripple_effects": [
-            {{"name": "Company or ticker", "direction": "BULLISH or BEARISH"}}
-        ]
-    }}
-    """
-    raw_text = call_llm(prompt)
+For each headline scoring {QUICK_SIGNAL_MIN_IMPACT} or more, output one object:
+{{"n": <headline number>, "impact": <1-10>, "direction": "BULLISH" or "BEARISH" or "MIXED",
+"tickers": [up to 3 exchange-listed symbols most affected, in Yahoo Finance format such as AAPL,
+RELIANCE.NS, ^NSEI, GC=F, CL=F, EURUSD=X, BTC-USD — use [] if the company is private or you are
+not sure of the symbol; never guess], "sector": "<short sector name>"}}
+Respond with ONLY a JSON array of these objects and nothing else. If none qualify, respond with []."""
+    raw_text = call_llm(prompt, tier="fast")
     if raw_text is None:
-        return "General Markets", None, []
+        return None
     try:
-        cleaned = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        parsed = json.loads(cleaned)
-        return parsed.get("sector", "General Markets"), parsed.get("primary_ticker"), parsed.get("ripple_effects", [])
-    except Exception as e:
-        report_error("Ripple analysis (parse)", e)
-        return "General Markets", None, []
+        start, end = raw_text.find("["), raw_text.rfind("]")
+        items = json.loads(raw_text[start:end + 1]) if start != -1 and end > start else []
+    except ValueError as e:
+        report_error("Triage (parse)", e)
+        return {}
+    triaged = {}
+    for item in items:
+        try:
+            n, impact = int(item["n"]), int(item["impact"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not 1 <= n <= len(headlines) or impact < QUICK_SIGNAL_MIN_IMPACT:
+            continue
+        direction = str(item.get("direction", "")).upper()
+        triaged[headlines[n - 1]] = {
+            "impact": min(impact, 10),
+            "direction": direction if direction in ("BULLISH", "BEARISH") else "MIXED",
+            "tickers": [str(t).strip() for t in (item.get("tickers") or []) if str(t).strip()][:3],
+            "sector": item.get("sector") or "General Markets",
+        }
+    return triaged
 
 
 def av_get(params):
-    if not ALPHAVANTAGE_API_KEY:
+    if not ALPHAVANTAGE_API_KEY or state.av_exhausted:
         return None
     elapsed = time.time() - state.last_av_call_time
     if elapsed < AV_MIN_SECONDS_BETWEEN_CALLS:
@@ -346,19 +574,13 @@ def av_get(params):
     state.av_calls_today += 1
     payload = resp.json()
     if "Note" in payload or "Information" in payload:
+        # The free tier allows only a few dozen calls a day. Once it says so, every further
+        # call today would also fail — after paying the 13s pacing sleep each time, which
+        # stalled every headline's analysis. Skip straight to yfinance until the daily reset.
+        state.av_exhausted = True
         return None
     return payload
 
-
-def resolve_ticker_yf(company_or_ticker):
-    try:
-        results = yf.Search(company_or_ticker, timeout=10).quotes
-        for r in results:
-            if r.get("quoteType") == "EQUITY":
-                return r.get("symbol")
-        return results[0]["symbol"] if results else None
-    except Exception:
-        return None
 
 
 def compute_rsi(closes, period=14):
@@ -446,30 +668,56 @@ def fetch_ticker_bar_data(symbol):
     return data
 
 
+_COMPANY_SUFFIXES = re.compile(r"\b(?:inc|corp|corporation|co|company|ltd|limited|plc|ag|sa|nv|holdings?|group)\b\.?", re.IGNORECASE)
+# Single-stock and thematic funds carry the company's name and are sometimes mislabeled as
+# EQUITY (live example: "Direxion Daily SpaceX Bull 2X ETF" for "SpaceX").
+_FUND_NAME = re.compile(r"\b(?:etf|etn|fund|[23]x|leveraged|inverse|ultra|bull|bear)\b", re.IGNORECASE)
+
+
+def _normalize_company(name):
+    return " ".join(_COMPANY_SUFFIXES.sub(" ", re.sub(r"[^\w&\s]", " ", name.lower())).split())
+
+
 def resolve_ticker(company_or_ticker):
+    """Maps an AI-supplied ticker or company name to a real listed symbol, or None. Search
+    always returns its closest matches even for companies that aren't listed (live example:
+    "Anthropic", which is private, came back as ANTW — a thematic "Anthropic AI Lab
+    Ecosystem ETF" — and a trade was written on it), so a result only counts if it is
+    exactly the symbol given, or a stock (never an ETF) whose listed name contains the
+    company name given."""
     if not company_or_ticker:
         return None
+    query = company_or_ticker.strip()
     cache = state.symbol_cache
-    if company_or_ticker in cache:
-        return cache[company_or_ticker]
-    resolved = None
+    if query in cache:
+        return cache[query]
     try:
-        payload = av_get({"function": "SYMBOL_SEARCH", "keywords": company_or_ticker})
-        if payload:
-            matches = payload.get("bestMatches", [])
-            resolved = matches[0]["1. symbol"] if matches else None
+        quotes = yf.Search(query, timeout=10).quotes
     except Exception:
-        resolved = None
+        return None  # not cached, so a transient failure gets retried next time
+    resolved = next((q["symbol"] for q in quotes if q.get("symbol", "").upper() == query.upper()), None)
     if not resolved:
-        resolved = resolve_ticker_yf(company_or_ticker)
-    cache[company_or_ticker] = resolved
+        wanted = _normalize_company(query)
+        for q in quotes:
+            listed_name = _normalize_company(q.get("longname") or q.get("shortname") or "")
+            if (wanted and q.get("quoteType") == "EQUITY" and not _FUND_NAME.search(listed_name)
+                    and re.search(rf"\b{re.escape(wanted)}\b", listed_name)):
+                resolved = q["symbol"]
+                break
+    cache[query] = resolved
     return resolved
 
 
 def fetch_market_data(ticker):
+    """yfinance first — free with no daily cap and no pacing sleep. Alpha Vantage's ~25
+    free calls/day are only a fallback for symbols yfinance can't price."""
     cached = get_cached_market_data(ticker)
     if cached:
         return cached
+    data = fetch_market_data_yf(ticker)
+    if data:
+        set_cached_market_data(ticker, data, "yf")
+        return data
     try:
         quote_payload = av_get({"function": "GLOBAL_QUOTE", "symbol": ticker})
         quote = quote_payload.get("Global Quote", {}) if quote_payload else {}
@@ -488,11 +736,7 @@ def fetch_market_data(ticker):
             return data
     except Exception:
         pass
-
-    data = fetch_market_data_yf(ticker)
-    if data:
-        set_cached_market_data(ticker, data, "yf")
-    return data
+    return None
 
 
 COMMODITY_MAP = [
@@ -511,10 +755,12 @@ COMMODITY_MAP = [
 ]
 
 
+_COMMODITY_PATTERNS = [(_word_regex([re.escape(k.strip()) for k in keywords]), rest) for keywords, *rest in COMMODITY_MAP]
+
+
 def detect_commodity(headline):
-    lower_headline = headline.lower()
-    for keywords, function, interval, display_name, metal_key in COMMODITY_MAP:
-        if any(keyword in lower_headline for keyword in keywords):
+    for pattern, (function, interval, display_name, metal_key) in _COMMODITY_PATTERNS:
+        if pattern.search(headline):
             return function, interval, display_name, metal_key
     return None
 
@@ -526,10 +772,12 @@ INDEX_MAP = [
 ]
 
 
+_INDEX_PATTERNS = [(_word_regex([re.escape(k) for k in keywords]), yf_symbol, display_name) for keywords, yf_symbol, display_name in INDEX_MAP]
+
+
 def detect_index(headline):
-    lower_headline = headline.lower()
-    for keywords, yf_symbol, display_name in INDEX_MAP:
-        if any(keyword in lower_headline for keyword in keywords):
+    for pattern, yf_symbol, display_name in _INDEX_PATTERNS:
+        if pattern.search(headline):
             return yf_symbol, display_name
     return None
 
@@ -561,14 +809,14 @@ def fetch_commodity_data(function, interval, display_name, metal_key):
     if cached:
         return cached
 
-    def yf_fallback():
-        yf_symbol = YF_METAL_SYMBOLS.get(metal_key) if metal_key else YF_COMMODITY_SYMBOLS.get(function)
-        if not yf_symbol:
-            return None
-        data = fetch_market_data_yf(yf_symbol)
-        if data:
-            data["display_name"] = display_name
-            set_cached_market_data(cache_key, data, "yf")
+    # Futures prices from yfinance first: daily, free, no cap and no pacing sleep. Alpha
+    # Vantage (many of its commodity series are only monthly) is the fallback for
+    # commodities yfinance has no symbol for, e.g. aluminum.
+    yf_symbol = YF_METAL_SYMBOLS.get(metal_key) if metal_key else YF_COMMODITY_SYMBOLS.get(function)
+    data = fetch_market_data_yf(yf_symbol) if yf_symbol else None
+    if data:
+        data["display_name"] = display_name
+        set_cached_market_data(cache_key, data, "yf")
         return data
 
     try:
@@ -577,7 +825,7 @@ def fetch_commodity_data(function, interval, display_name, metal_key):
             params["interval"] = interval
         payload = av_get(params)
         if not payload:
-            return yf_fallback()
+            return None
 
         latest_value, previous_value, as_of = None, None, None
 
@@ -599,7 +847,7 @@ def fetch_commodity_data(function, interval, display_name, metal_key):
                 as_of = series[0].get("date")
 
         if latest_value is None:
-            return yf_fallback()
+            return None
 
         change_percent = None
         if previous_value:
@@ -615,10 +863,10 @@ def fetch_commodity_data(function, interval, display_name, metal_key):
         set_cached_market_data(cache_key, data, "av")
         return data
     except Exception:
-        return yf_fallback()
+        return None
 
 
-def run_deep_analysis(headline, sector, resolved_ticker, ripple_effects):
+def run_deep_analysis(headline, sector, resolved_ticker):
     try:
         index_match = detect_index(headline)
         commodity_match = detect_commodity(headline)
@@ -651,17 +899,17 @@ def run_deep_analysis(headline, sector, resolved_ticker, ripple_effects):
     else:
         grounding = "No real-time market data was available for this ticker right now — reason from the headline alone and say so in the strategy."
 
-    ripple_note = ""
-    if ripple_effects:
-        ripple_summary = ", ".join(f"{r.get('name')} ({r.get('direction')})" for r in ripple_effects if r.get("name"))
-        ripple_note = f"Related unverified ripple plays identified separately: {ripple_summary}. You may reference these in your strategy but do not treat them as fact-checked."
-
+    # Ripple plays come back from this same call — previously a separate AI call per
+    # headline, which paid for the prompt and the model's hidden reasoning twice.
     prompt = f"""
     Analyze this high-impact market headline: "{headline}"
     Likely affected sector: {sector}. Verified ticker for grounding: {resolved_ticker or "none found"}.
     {grounding}
-    {ripple_note}
     Provide an institutional-grade trading setup across US Stocks, Indian Markets, Global Stocks, Crypto, and Commodities.
+    Only name tickers you are confident are real, exchange-listed symbols, in Yahoo Finance format (AAPL, RELIANCE.NS,
+    KGX.DE, 7203.T); leave a list empty rather than guess.
+    Also list up to 4 related plays that could ripple from this news across the supply chain, competitors,
+    commodities or currencies — specific companies preferred over broad ETFs — each with a direction.
     Keep the strategy field to 2-3 concise sentences (under 60 words) — no filler, no repetition.
     Also write a one-sentence plain-language summary of what happened and why it matters (under 30 words,
     distinct from both the headline and the key takeaways — this is the expanded explanation shown under the headline).
@@ -678,13 +926,14 @@ def run_deep_analysis(headline, sector, resolved_ticker, ripple_effects):
         "sell_targets": ["Ticker1", "Ticker2"],
         "strategy": "Concise action to take before market open, referencing the real data if provided.",
         "category": "Signal / Market News / Analysis / Alert / Trade Idea / Macro View",
-        "key_takeaways": ["Short takeaway 1", "Short takeaway 2", "Short takeaway 3"]
+        "key_takeaways": ["Short takeaway 1", "Short takeaway 2", "Short takeaway 3"],
+        "ripple_effects": [{{"name": "Company or ticker", "direction": "BULLISH or BEARISH"}}]
     }}
     """
-    raw_text = call_llm(prompt)
+    raw_text = call_llm(prompt, tier="deep")
     if raw_text is None:
         return {"sentiment": "ERROR", "sector": "None", "buy_targets": [], "sell_targets": [],
-                "strategy": "Both Groq and the OpenRouter fallback failed — see the Last Error banner for details.",
+                "strategy": "All AI providers failed — see the Last Error banner for details.",
                 "market_data": market_data, "grounded_ticker": resolved_ticker}
     try:
         cleaned = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -697,51 +946,208 @@ def run_deep_analysis(headline, sector, resolved_ticker, ripple_effects):
         return {"sentiment": "ERROR", "sector": "None", "buy_targets": [], "sell_targets": [], "strategy": str(e), "market_data": market_data, "grounded_ticker": resolved_ticker}
 
 
-RSS_SOURCE_NAMES = {
-    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US": "Yahoo Finance",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html": "CNBC",
-    "https://www.investing.com/rss/news_25.rss": "Investing.com",
-    "https://feeds.bloomberg.com/markets/news.rss": "Bloomberg",
-    "https://feeds.bloomberg.com/economics/news.rss": "Bloomberg Economics",
-}
+# "every" = minimum seconds between polls of that source (0 = every scan). Slow-moving or
+# rate-limit-sensitive sources (Google News, central banks) are polled less often.
+# Checked live: Moneycontrol's feeds are years stale, Kitco's 404s, so neither is listed.
+NEWS_SOURCES = [
+    # Global markets and economy
+    {"name": "Bloomberg Markets", "url": "https://feeds.bloomberg.com/markets/news.rss", "region": "Global"},
+    {"name": "Bloomberg Economics", "url": "https://feeds.bloomberg.com/economics/news.rss", "region": "Global"},
+    {"name": "Bloomberg Politics", "url": "https://feeds.bloomberg.com/politics/news.rss", "region": "Global", "every": 60},
+    {"name": "Bloomberg Technology", "url": "https://feeds.bloomberg.com/technology/news.rss", "region": "Global", "every": 60},
+    {"name": "CNBC", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "region": "Global"},
+    {"name": "CNBC World", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "region": "Global"},
+    {"name": "CNBC Finance", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "region": "Global"},
+    {"name": "CNBC Earnings", "url": "https://www.cnbc.com/id/15839135/device/rss/rss.html", "region": "Global", "every": 60},
+    {"name": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories", "region": "Global"},
+    {"name": "MarketWatch Bulletins", "url": "https://feeds.content.dowjones.io/public/rss/mw_bulletins", "region": "Global"},
+    {"name": "WSJ Markets", "url": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain", "region": "Global"},
+    {"name": "WSJ World", "url": "https://feeds.content.dowjones.io/public/rss/RSSWorldNews", "region": "Global", "every": 60},
+    {"name": "Financial Times", "url": "https://www.ft.com/markets?format=rss", "region": "Global"},
+    {"name": "Yahoo Finance", "url": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US", "region": "Global"},
+    {"name": "Investing.com", "url": "https://www.investing.com/rss/news_25.rss", "region": "Global"},
+    {"name": "Investing.com Economy", "url": "https://www.investing.com/rss/news_14.rss", "region": "Global"},
+    {"name": "Investing.com Indicators", "url": "https://www.investing.com/rss/news_95.rss", "region": "Global"},
+    {"name": "Seeking Alpha", "url": "https://seekingalpha.com/market_currents.xml", "region": "Global"},
+    {"name": "Benzinga", "url": "https://www.benzinga.com/feed", "region": "Global", "every": 60},
+    {"name": "Reuters (Google News)", "url": "https://news.google.com/rss/search?q=site:reuters.com+markets+when:1h&hl=en-US&gl=US&ceid=US:en", "region": "Global", "every": 180},
+    {"name": "Reuters Business (Google News)", "url": "https://news.google.com/rss/search?q=site:reuters.com+business+when:1h&hl=en-US&gl=US&ceid=US:en", "region": "Global", "every": 180},
+    {"name": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "region": "Global", "every": 300},
+    {"name": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html", "region": "Global", "every": 300},
+    # India
+    {"name": "Economic Times Markets", "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms", "region": "India"},
+    {"name": "Economic Times Stocks", "url": "https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms", "region": "India"},
+    {"name": "Economic Times Economy", "url": "https://economictimes.indiatimes.com/news/economy/rssfeeds/1373380680.cms", "region": "India"},
+    {"name": "LiveMint Markets", "url": "https://www.livemint.com/rss/markets", "region": "India"},
+    {"name": "LiveMint Economy", "url": "https://www.livemint.com/rss/economy", "region": "India", "every": 60},
+    {"name": "Business Standard Markets", "url": "https://www.business-standard.com/rss/markets-106.rss", "region": "India"},
+    {"name": "Business Standard Economy", "url": "https://www.business-standard.com/rss/economy-102.rss", "region": "India", "every": 60},
+    {"name": "BusinessLine Markets", "url": "https://www.thehindubusinessline.com/markets/feeder/default.rss", "region": "India"},
+    {"name": "NDTV Profit", "url": "https://feeds.feedburner.com/ndtvprofit-latest", "region": "India"},
+    {"name": "India Markets (Google News)", "url": "https://news.google.com/rss/search?q=sensex+OR+nifty+OR+sebi+OR+rbi+when:1h&hl=en-IN&gl=IN&ceid=IN:en", "region": "India", "every": 180},
+    {"name": "RBI", "url": "https://www.rbi.org.in/pressreleases_rss.xml", "region": "India", "every": 300},
+    # Commodities
+    {"name": "Investing.com Commodities", "url": "https://www.investing.com/rss/news_11.rss", "region": "Commodities"},
+    {"name": "Economic Times Commodities", "url": "https://economictimes.indiatimes.com/markets/commodities/rssfeeds/1808152121.cms", "region": "Commodities"},
+    {"name": "OilPrice.com", "url": "https://oilprice.com/rss/main", "region": "Commodities", "every": 60},
+    {"name": "Mining.com", "url": "https://www.mining.com/feed/", "region": "Commodities", "every": 120},
+    {"name": "Commodities (Google News)", "url": "https://news.google.com/rss/search?q=crude+OR+gold+OR+copper+OR+opec+prices+when:1h&hl=en-US&gl=US&ceid=US:en", "region": "Commodities", "every": 180},
+    # Forex
+    {"name": "Investing.com Forex", "url": "https://www.investing.com/rss/news_1.rss", "region": "Forex"},
+    {"name": "FXStreet", "url": "https://www.fxstreet.com/rss/news", "region": "Forex"},
+    # Crypto
+    {"name": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "region": "Crypto", "every": 60},
+    {"name": "Cointelegraph", "url": "https://cointelegraph.com/rss", "region": "Crypto", "every": 60},
+    # Finnhub news API — only polled when FINNHUB_API_KEY is set.
+    {"name": "Finnhub General", "finnhub_category": "general", "region": "Global", "every": 60},
+    {"name": "Finnhub Mergers", "finnhub_category": "merger", "region": "Global", "every": 60},
+    {"name": "Finnhub Forex", "finnhub_category": "forex", "region": "Forex", "every": 60},
+    {"name": "Finnhub Crypto", "finnhub_category": "crypto", "region": "Crypto", "every": 60},
+]
+
+_http = requests.Session()
+_http.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+_source_last_polled = {}
+_feed_validators = {}  # url -> ETag / Last-Modified, for conditional GETs
+_undated_titles = {}  # source name -> undated titles seen on its previous poll
+_recent_story_tokens = collections.deque(maxlen=2000)  # (accepted_at, word set) for dedup
+_DEDUP_STOPWORDS = frozenset(
+    "the a an and or of to in on for with as at by from after amid over its it is are be was "
+    "were has have had says said new than this that into up down".split()
+)
+
+
+def _fetch_rss(source):
+    """Returns [(title, link, published_utc_or_None, publisher_or_None)], or None if the
+    feed is unchanged since the last poll. Conditional GET means an unchanged feed costs a
+    tiny 304 instead of a full download and re-parse every scan."""
+    url = source["url"]
+    validators = _feed_validators.get(url, {})
+    headers = {}
+    if validators.get("etag"):
+        headers["If-None-Match"] = validators["etag"]
+    if validators.get("modified"):
+        headers["If-Modified-Since"] = validators["modified"]
+    resp = _http.get(url, headers=headers, timeout=FEED_TIMEOUT_SECONDS)
+    if resp.status_code == 304:
+        return None
+    resp.raise_for_status()
+    _feed_validators[url] = {"etag": resp.headers.get("ETag"), "modified": resp.headers.get("Last-Modified")}
+    feed = feedparser.parse(resp.content)
+    items = []
+    for entry in feed.entries:
+        title = " ".join(entry.get("title", "").split())
+        if not title:
+            continue
+        # Google News titles end in " - Reuters" etc.; keep the publisher, drop the suffix.
+        publisher = entry.get("source", {}).get("title")
+        if publisher and title.endswith(f" - {publisher}"):
+            title = title[: -len(publisher) - 3]
+        # published_parsed is UTC — the article's real publish time, not when we saw it.
+        published = entry.get("published_parsed") or entry.get("updated_parsed")
+        items.append((title, entry.get("link"), datetime(*published[:6]) if published else None, publisher))
+    return items
+
+
+def _fetch_finnhub(source):
+    resp = _http.get(
+        "https://finnhub.io/api/v1/news",
+        params={"category": source["finnhub_category"], "token": FINNHUB_API_KEY},
+        timeout=FEED_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    items = []
+    for article in resp.json():
+        title = " ".join((article.get("headline") or "").split())
+        if not title:
+            continue
+        published = datetime.fromtimestamp(article["datetime"], timezone.utc).replace(tzinfo=None) if article.get("datetime") else None
+        items.append((title, article.get("url"), published, article.get("source")))
+    return items
+
+
+def _fetch_source(source):
+    try:
+        if "finnhub_category" in source:
+            return source, _fetch_finnhub(source)
+        return source, _fetch_rss(source)
+    except Exception as e:
+        print(f"[pipeline] Feed '{source['name']}' failed: {str(e)[:150]}")
+        return source, None
+
+
+def _story_tokens(title):
+    return frozenset(w for w in re.findall(r"[a-z0-9$%&]+", title.lower()) if len(w) > 1 and w not in _DEDUP_STOPWORDS)
+
+
+def _is_duplicate_story(tokens, now):
+    """True if a story with mostly the same words was already accepted recently — the same
+    news syndicated across outlets with reworded titles would otherwise become several
+    separate signals."""
+    if len(tokens) < 4:
+        return False
+    for accepted_at, seen in _recent_story_tokens:
+        if now - accepted_at <= DEDUP_WINDOW_SECONDS and len(tokens & seen) / len(tokens | seen) >= DEDUP_SIMILARITY:
+            return True
+    return False
 
 
 def fetch_live_financial_news():
-    rss_urls = list(RSS_SOURCE_NAMES.keys())
+    """Polls every due source in parallel and returns the new headlines that are fresh,
+    market-relevant and not a duplicate of a story already queued."""
+    now = time.time()
+    due = [
+        s for s in NEWS_SOURCES
+        if ("finnhub_category" not in s or FINNHUB_API_KEY)
+        and now - _source_last_polled.get(s["name"], 0) >= s.get("every", 0)
+    ]
+    for s in due:
+        _source_last_polled[s["name"]] = now
+    with concurrent.futures.ThreadPoolExecutor(max_workers=FEED_FETCH_WORKERS) as executor:
+        results = list(executor.map(_fetch_source, due))
 
+    cutoff = datetime.utcnow() - timedelta(minutes=MAX_HEADLINE_AGE_MINUTES)
     new_headlines_found = []
-    for url in rss_urls:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
-                if entry.title not in state.processed_headlines:
-                    # entry.published_parsed is a UTC struct_time whenever the feed
-                    # supplies a <pubDate>/<published> element (confirmed present on
-                    # all 5 sources below). This is the article's real publish time,
-                    # not when our pipeline got around to analyzing it — falls back
-                    # to "now" only if a feed is ever missing it.
-                    published_struct = getattr(entry, "published_parsed", None)
-                    published_dt = datetime(*published_struct[:6]) if published_struct else datetime.utcnow()
-                    state.processed_headlines[entry.title] = time.time()
-                    # Its seen-marker may have been pruned already, so without this a
-                    # stale article still sitting in a feed would be analyzed again.
-                    if published_dt < datetime.utcnow() - timedelta(days=RETENTION_DAYS):
-                        continue
-                    new_headlines_found.append(entry.title)
-                    published_at = published_dt.isoformat() + "Z"
-                    state.headline_metadata[entry.title] = {
-                        "link": getattr(entry, "link", None),
-                        "source": RSS_SOURCE_NAMES.get(url, "Unknown source"),
-                        "published_at": published_at,
-                    }
-        except Exception:
+    marked_any = False
+    for source, items in results:
+        if items is None:
             continue
-    if new_headlines_found:
+        # Undated entries (e.g. RBI press releases) have no publish time to check, so they
+        # count as new only if they weren't in this source's previous poll — and nothing is
+        # new on the first poll after startup, when there's no previous poll to compare to.
+        undated_before = _undated_titles.get(source["name"])
+        _undated_titles[source["name"]] = {title for title, _, published, _ in items if published is None}
+        for title, link, published_dt, publisher in items:
+            if title in state.processed_headlines:
+                continue
+            state.processed_headlines[title] = now
+            marked_any = True
+            if published_dt is None:
+                if undated_before is None or title in undated_before:
+                    continue
+                published_dt = datetime.utcnow()
+            if published_dt < cutoff or not is_market_relevant(title):
+                continue
+            tokens = _story_tokens(title)
+            if _is_duplicate_story(tokens, now):
+                continue
+            _recent_story_tokens.append((now, tokens))
+            new_headlines_found.append(title)
+            state.headline_metadata[title] = {
+                "link": link,
+                "source": publisher if publisher and publisher != source["name"] else source["name"],
+                "region": source["region"],
+                "published_at": published_dt.isoformat() + "Z",
+            }
+
+    if marked_any:
         # Bound the in-memory copies too, not just what gets persisted — otherwise they grow
         # for the life of the process on Render's 512MB instance.
         _trim_oldest(state.processed_headlines, MAX_STORED_HEADLINES)
         _trim_oldest(state.headline_metadata, MAX_HEADLINE_METADATA)
-        save_processed_headlines(state.processed_headlines)
+        if now - state.headlines_saved_at >= HEADLINES_SAVE_INTERVAL_SECONDS:
+            save_processed_headlines(state.processed_headlines)
+            state.headlines_saved_at = now
     return new_headlines_found
 
 
@@ -786,9 +1192,19 @@ def category_style(category):
     return CATEGORY_STYLE.get(category, {"icon": "📊", "color": "#6b7280"})
 
 
+def _headline_published(headline):
+    """A queued headline's publish time (naive UTC); datetime.min if its metadata is gone,
+    so it sorts last and counts as stale."""
+    published_at = state.headline_metadata.get(headline, {}).get("published_at")
+    try:
+        return datetime.fromisoformat(published_at.removesuffix("Z"))
+    except (AttributeError, ValueError):
+        return datetime.min
+
+
 def run_pipeline_cycle():
-    """One tick of the pipeline: scan feeds if the interval elapsed and the queue is
-    empty, then batch-filter or deep-analyze whatever is in the queue. This is the same
+    """One tick of the pipeline: scan feeds if the interval elapsed, then batch-filter or
+    deep-analyze whatever is in the queue. This is the same
     logic that used to live inline in app.py's pipeline_fragment(), just without any
     Streamlit UI calls — the scheduler calls this repeatedly in the background.
     Reads refresh_interval_seconds/active from state so PATCH /api/settings can change
@@ -798,32 +1214,54 @@ def run_pipeline_cycle():
         return None
     now = time.time()
 
-    if (not state.pending_headlines and not state.qualified_headlines
-            and now - state.last_scan_time >= state.refresh_interval_seconds):
-        new_headlines = fetch_live_financial_news()
+    # Scans run on schedule even while older headlines are still queued — waiting for the
+    # queue to drain first meant breaking news sat unseen behind a backlog.
+    if now - state.last_scan_time >= state.refresh_interval_seconds:
         state.last_scan_time = now
+        new_headlines = fetch_live_financial_news()
         if new_headlines:
             state.pending_headlines.extend(new_headlines)
+            del state.pending_headlines[:-MAX_PENDING_HEADLINES]
 
-    qualifying_headline = None
-    if state.qualified_headlines:
-        qualifying_headline = state.qualified_headlines.pop(0)
-    elif state.pending_headlines and time.time() >= state.ai_unavailable_until:
+    cutoff = datetime.utcnow() - timedelta(minutes=MAX_HEADLINE_AGE_MINUTES)
+    state.qualified_headlines = [h for h in state.qualified_headlines if _headline_published(h) >= cutoff]
+    state.pending_headlines = [h for h in state.pending_headlines if _headline_published(h) >= cutoff]
+
+    if not state.qualified_headlines and state.pending_headlines and time.time() >= state.ai_unavailable_until:
+        # Newest first: the freshest news is the most tradeable.
+        state.pending_headlines.sort(key=_headline_published, reverse=True)
         batch = state.pending_headlines[:BATCH_FILTER_SIZE]
         state.pending_headlines = state.pending_headlines[len(batch):]
-        qualifying = run_groq_filter_batch(batch)
-        if qualifying:
-            qualifying_headline = qualifying[0]
-            state.qualified_headlines.extend(qualifying[1:])
+        triaged = triage_headlines(batch)
+        if triaged is None:
+            state.pending_headlines[:0] = batch  # every AI provider is down: retry after cooldown
+        else:
+            threshold = deep_impact_threshold()
+            for headline, triage in triaged.items():
+                state.headline_metadata.setdefault(headline, {})["triage"] = triage
+                if triage["impact"] >= threshold:
+                    state.qualified_headlines.append(headline)
+                else:
+                    _publish_alert(headline, _quick_alert(headline, triage))
+            # Biggest news first, then newest.
+            state.qualified_headlines.sort(key=lambda h: (_headline_triage(h).get("impact", 0), _headline_published(h)), reverse=True)
 
-    if not qualifying_headline:
+    if not state.qualified_headlines:
         return None
 
-    headline = qualifying_headline
-    sector, company_guess, ripple_effects = analyze_ripple_effect(headline)
-    resolved_ticker = None if (detect_commodity(headline) or detect_index(headline)) else resolve_ticker(company_guess)
-    ai_blueprint = run_deep_analysis(headline, sector, resolved_ticker, ripple_effects)
+    headline = state.qualified_headlines.pop(0)
+    triage = _headline_triage(headline)
+    primary = (triage.get("tickers") or [None])[0]
+    resolved_ticker = None if (detect_commodity(headline) or detect_index(headline)) else resolve_ticker(primary)
+    ai_blueprint = run_deep_analysis(headline, triage.get("sector", "General Markets"), resolved_ticker)
+    if ai_blueprint.get("sentiment") == "ERROR" and triage:
+        # Deep analysis unavailable — still publish what triage already knows rather than
+        # dropping a high-impact headline or showing an error card.
+        new_alert = _quick_alert(headline, triage)
+        _publish_alert(headline, new_alert)
+        return new_alert
 
+    ripple_effects = [r for r in (ai_blueprint.get("ripple_effects") or []) if isinstance(r, dict)]
     market_data = ai_blueprint.get("market_data")
     grounded_reading = "No live data available"
     if market_data:
@@ -847,23 +1285,70 @@ def run_pipeline_cycle():
         "Timestamp": source_meta.get("published_at") or datetime.utcnow().isoformat() + "Z",
         "Headline": headline,
         "Summary": ai_blueprint.get("summary"),
-        "Sentiment": ai_blueprint.get("sentiment"),
-        "Sector": ai_blueprint.get("sector"),
-        "Buy Tickers": ", ".join(ai_blueprint.get("buy_targets", [])),
-        "Sell Tickers": ", ".join(ai_blueprint.get("sell_targets", [])),
+        # Always a string: the frontend calls .toUpperCase() on it.
+        "Sentiment": ai_blueprint.get("sentiment") or "NEUTRAL",
+        "Sector": ai_blueprint.get("sector") or triage.get("sector", "General Markets"),
+        "Buy Tickers": ", ".join(_valid_tickers(ai_blueprint.get("buy_targets"))),
+        "Sell Tickers": ", ".join(_valid_tickers(ai_blueprint.get("sell_targets"))),
         "Execution Blueprint": ai_blueprint.get("strategy"),
         "Grounded Data": grounded_reading,
         "Ripple Effects (AI-inferred, unverified)": ripple_display,
         "Category": ai_blueprint.get("category", "Signal"),
         "Key Takeaways": ai_blueprint.get("key_takeaways", []),
+        "Impact": triage.get("impact"),
+        "Analysis": "Deep",
+        "Region": source_meta.get("region"),
         "Source": source_meta.get("source"),
         "Article Link": source_meta.get("link")
     }
-    state.trade_history.insert(0, new_alert)
+    _publish_alert(headline, new_alert)
+    return new_alert
+
+
+def _headline_triage(headline):
+    return state.headline_metadata.get(headline, {}).get("triage", {})
+
+
+def _valid_tickers(symbols):
+    """AI-named tickers that resolve to real listed symbols; unverifiable ones are dropped
+    rather than shown as tradeable."""
+    resolved = (resolve_ticker(str(s)) for s in (symbols or []) if isinstance(s, str))
+    return list(dict.fromkeys(t for t in resolved if t))
+
+
+def _quick_alert(headline, triage):
+    """A signal built from the triage answer alone — no extra AI call — for headlines that
+    matter but don't clear the deep-analysis bar, or when deep analysis is unavailable."""
+    meta = state.headline_metadata.get(headline, {})
+    tickers = _valid_tickers(triage["tickers"])
+    direction = triage["direction"]
+    return {
+        "Timestamp": meta.get("published_at") or datetime.utcnow().isoformat() + "Z",
+        "Headline": headline,
+        "Summary": None,
+        "Sentiment": {"BULLISH": "BULLISH", "BEARISH": "BEARISH"}.get(direction, "NEUTRAL"),
+        "Sector": triage["sector"],
+        "Buy Tickers": ", ".join(tickers) if direction == "BULLISH" else "",
+        "Sell Tickers": ", ".join(tickers) if direction == "BEARISH" else "",
+        "Tickers": ", ".join(tickers),
+        "Execution Blueprint": f"Quick signal (impact {triage['impact']}/10) — scored by AI triage, not deep-analyzed.",
+        "Grounded Data": "Not fetched for quick signals",
+        "Ripple Effects (AI-inferred, unverified)": "None identified",
+        "Category": "Market News",
+        "Key Takeaways": [],
+        "Impact": triage["impact"],
+        "Analysis": "Quick",
+        "Region": meta.get("region"),
+        "Source": meta.get("source"),
+        "Article Link": meta.get("link"),
+    }
+
+
+def _publish_alert(headline, alert):
+    state.trade_history.insert(0, alert)
     del state.trade_history[MAX_STORED_ALERTS:]
     state.headline_metadata.pop(headline, None)
-    save_trade_history(state.trade_history)
-    return new_alert
+    append_signal(alert)
 
 
 # --- MARKET REGIME ---

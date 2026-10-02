@@ -1,10 +1,12 @@
 import asyncio
 import json
+import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -12,6 +14,19 @@ from pydantic import BaseModel
 from backend import pipeline, scheduler, realtime
 
 _realtime_task = None
+
+# Shared secret for every endpoint that changes state (pause the bot, edit the watchlist,
+# trigger scans). The Next.js frontend sends it from its server-side env, so it never
+# reaches a browser. Unset = endpoints stay open, so deploying this before the frontend
+# has the token can't break anything; set it on both sides to lock them.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+if not ADMIN_TOKEN:
+    print("[main] ADMIN_TOKEN is not set — write endpoints are open to anyone with the URL")
+
+
+def require_admin(x_admin_token: Optional[str] = Header(default=None)):
+    if ADMIN_TOKEN and not secrets.compare_digest(x_admin_token or "", ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Admin-Token")
 
 
 @asynccontextmanager
@@ -69,6 +84,9 @@ def get_usage():
         "groq_tokens_today": s.groq_tokens_today,
         "openrouter_tokens_today": s.openrouter_tokens_today,
         "gemini_tokens_today": s.gemini_tokens_today,
+        "groq_tokens_by_model_today": s.model_tokens_today,
+        "groq_daily_limit_per_model": pipeline.GROQ_DAILY_TOKEN_LIMIT,
+        "deep_analysis_min_impact": pipeline.deep_impact_threshold(),
         "av_calls_today": s.av_calls_today,
         "headlines_queued": len(s.pending_headlines) + len(s.qualified_headlines),
         "ai_cooldown_remaining": max(0, int(s.ai_unavailable_until - time.time())),
@@ -86,10 +104,18 @@ def get_status():
         "ai_engine": not cooldown_active,
         "data_pipeline": s.last_error is None or not cooldown_active,
         "cache_age_seconds": round(time.time() - s.cache_last_updated, 1) if s.cache_last_updated else None,
+        "memory_mb": pipeline.process_memory_mb(),
+        "write_endpoints_protected": bool(ADMIN_TOKEN),
     }
 
 
-@app.post("/api/scan")
+@app.get("/api/errors")
+def get_errors():
+    """The last 50 errors, newest first — /api/usage only ever shows the latest one."""
+    return {"errors": list(reversed(pipeline.state.recent_errors))}
+
+
+@app.post("/api/scan", dependencies=[Depends(require_admin)])
 def trigger_scan():
     new_headlines = pipeline.fetch_live_financial_news()
     pipeline.state.pending_headlines.extend(new_headlines)
@@ -128,7 +154,7 @@ class WatchlistAddRequest(BaseModel):
     label: Optional[str] = None
 
 
-@app.post("/api/watchlist")
+@app.post("/api/watchlist", dependencies=[Depends(require_admin)])
 def post_watchlist(body: WatchlistAddRequest):
     try:
         pipeline.add_to_watchlist(body.symbol, body.label)
@@ -142,7 +168,7 @@ def post_watchlist(body: WatchlistAddRequest):
     return result
 
 
-@app.delete("/api/watchlist/{symbol}")
+@app.delete("/api/watchlist/{symbol}", dependencies=[Depends(require_admin)])
 def delete_watchlist(symbol: str):
     pipeline.remove_from_watchlist(symbol)
     result = {"watchlist": pipeline.refresh_watchlist_cache()}
@@ -194,7 +220,7 @@ class SettingsUpdateRequest(BaseModel):
     refresh_interval_seconds: Optional[int] = None
 
 
-@app.patch("/api/settings")
+@app.patch("/api/settings", dependencies=[Depends(require_admin)])
 def patch_settings(body: SettingsUpdateRequest):
     s = pipeline.state
     if body.active is not None:

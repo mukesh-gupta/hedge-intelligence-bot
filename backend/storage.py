@@ -31,6 +31,23 @@ def redis_get_json(key, default):
         return default
 
 
+def redis_pipeline(commands):
+    """Runs several Redis commands (each a list like ["LPUSH", "key", "value"]) in one REST
+    round trip. Returns the list of results, or None on any failure — same never-raise
+    contract as the helpers above."""
+    if not is_configured() or not commands:
+        return None
+    try:
+        resp = requests.post(f"{UPSTASH_URL}/pipeline", headers=_headers(), data=json.dumps(commands), timeout=15)
+        resp.raise_for_status()
+        replies = resp.json()
+        if any("error" in r for r in replies):
+            return None
+        return [r.get("result") for r in replies]
+    except Exception:
+        return None
+
+
 def redis_set_json(key, value) -> bool:
     """Writes a JSON value to Upstash Redis. Returns False on failure instead
     of raising, so callers can report it via the existing report_error()

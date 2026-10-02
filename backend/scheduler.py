@@ -1,4 +1,7 @@
 import asyncio
+import os
+
+import requests
 
 from backend import pipeline
 
@@ -15,8 +18,14 @@ TICK_SECONDS = 5
 # GET request hits an already-warm cache instead of blocking on a live yfinance call.
 MARKET_DATA_WARM_SECONDS = 45
 
+# Render's free plan spins a web service down after 15 minutes without inbound requests,
+# which stops both loops above until someone opens the app. Pinging our own public URL
+# well inside that window counts as inbound traffic and keeps the bot scanning 24/7.
+KEEPALIVE_SECONDS = 600
+
 _pipeline_task = None
 _market_data_task = None
+_keepalive_task = None
 
 
 async def _pipeline_loop():
@@ -48,23 +57,34 @@ async def _market_data_warm_loop():
         await asyncio.sleep(MARKET_DATA_WARM_SECONDS)
 
 
+async def _keepalive_loop(base_url):
+    while True:
+        await asyncio.sleep(KEEPALIVE_SECONDS)
+        try:
+            await asyncio.to_thread(requests.get, f"{base_url}/api/status", timeout=30)
+        except Exception as e:
+            pipeline.report_error("Keep-alive ping", e)
+
+
 def start():
-    """Launch both background loops on the running event loop. Runs independent of any
+    """Launch the background loops on the running event loop. Runs independent of any
     connected HTTP client — this is the point of moving off Streamlit's run_every, which
     only ticked while a browser tab with an open script-run was present."""
-    global _pipeline_task, _market_data_task
+    global _pipeline_task, _market_data_task, _keepalive_task
     if _pipeline_task is None or _pipeline_task.done():
         _pipeline_task = asyncio.create_task(_pipeline_loop())
     if _market_data_task is None or _market_data_task.done():
         _market_data_task = asyncio.create_task(_market_data_warm_loop())
+    # Render sets RENDER_EXTERNAL_URL itself; when running locally it's unset and no ping runs.
+    base_url = os.getenv("RENDER_EXTERNAL_URL")
+    if base_url and (_keepalive_task is None or _keepalive_task.done()):
+        _keepalive_task = asyncio.create_task(_keepalive_loop(base_url.rstrip("/")))
     return _pipeline_task, _market_data_task
 
 
 def stop():
-    global _pipeline_task, _market_data_task
-    if _pipeline_task is not None:
-        _pipeline_task.cancel()
-        _pipeline_task = None
-    if _market_data_task is not None:
-        _market_data_task.cancel()
-        _market_data_task = None
+    global _pipeline_task, _market_data_task, _keepalive_task
+    for task in (_pipeline_task, _market_data_task, _keepalive_task):
+        if task is not None:
+            task.cancel()
+    _pipeline_task = _market_data_task = _keepalive_task = None
