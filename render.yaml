@@ -6,6 +6,10 @@ services:
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      # Caps glibc's per-thread malloc arenas — without it, the thread-pooled yfinance
+      # fetches fragment memory that never returns to the OS, and RSS creeps past 512MB.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
       - key: GROQ_API_KEY
         sync: false
       - key: ALPHAVANTAGE_API_KEY

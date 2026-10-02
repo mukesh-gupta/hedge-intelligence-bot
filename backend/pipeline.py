@@ -1,4 +1,6 @@
 import concurrent.futures
+import gc
+import itertools
 import json
 import os
 import re
@@ -34,6 +36,9 @@ BATCH_FILTER_SIZE = 20
 MAX_STORED_ALERTS = 2000
 # ~70 bytes/entry observed, so 5000 entries is ~350KB.
 MAX_STORED_HEADLINES = 5000
+# Metadata is only needed until a headline is analyzed; ones the filter rejects would
+# otherwise linger forever.
+MAX_HEADLINE_METADATA = 500
 DEFAULT_WATCHLIST = [
     {"symbol": "NDAQ", "label": "NDAQ"},
     {"symbol": "MS", "label": "MS"},
@@ -111,11 +116,13 @@ def save_trade_history(history):
 
 
 def load_processed_headlines():
-    return set(storage.redis_get_json("processed_headlines", []))
+    # A dict (insertion-ordered) rather than a set, so trimming keeps the NEWEST headlines —
+    # list(set)[-N:] dropped an arbitrary subset instead.
+    return dict.fromkeys(storage.redis_get_json("processed_headlines", []))
 
 
-def save_processed_headlines(headlines_set):
-    trimmed = list(headlines_set)[-MAX_STORED_HEADLINES:]
+def save_processed_headlines(headlines):
+    trimmed = list(headlines)[-MAX_STORED_HEADLINES:]
     if not storage.redis_set_json("processed_headlines", trimmed):
         report_error("Persisting seen-headlines", "Upstash write failed")
 
@@ -318,11 +325,9 @@ def resolve_ticker_yf(company_or_ticker):
 def compute_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
-    deltas = closes.diff().dropna()
-    gains = deltas.clip(lower=0)
-    losses = -deltas.clip(upper=0)
-    avg_gain = gains.rolling(period).mean().iloc[-1]
-    avg_loss = losses.rolling(period).mean().iloc[-1]
+    deltas = [b - a for a, b in zip(closes[-period - 1:], closes[-period:])]
+    avg_gain = sum(d for d in deltas if d > 0) / period
+    avg_loss = sum(-d for d in deltas if d < 0) / period
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -344,23 +349,40 @@ def set_cached_market_data(key, data, source):
     state.market_data_cache[key] = {"data": data, "source": source, "cached_at": time.time()}
 
 
-def fetch_market_data_yf(ticker):
+def fetch_closes_yf(ticker):
+    """One cached 3-month daily-close download per symbol, shared by the quote/RSI path and
+    the sparkline path (which previously downloaded 2mo and 3mo separately). Converted to a
+    plain list right away so the pandas DataFrame doesn't outlive this call."""
+    cache_key = f"CLOSES:{ticker}"
+    cached = get_cached_market_data(cache_key)
+    if cached:
+        return cached
     try:
-        hist = yf.Ticker(ticker).history(period="2mo", timeout=10)
-        if hist.empty or len(hist) < 2:
+        hist = yf.Ticker(ticker).history(period="3mo", timeout=10)
+        if hist.empty:
             return None
-        closes = hist["Close"]
-        latest_price = float(closes.iloc[-1])
-        prev_price = float(closes.iloc[-2])
-        change_percent = f"{((latest_price - prev_price) / prev_price) * 100:.2f}%" if prev_price else None
-        return {
-            "price": round(latest_price, 2),
-            "change_percent": change_percent,
-            "rsi": compute_rsi(closes),
-            "as_of": str(hist.index[-1].date())
-        }
+        result = {"closes": [float(c) for c in hist["Close"].tolist()], "as_of": str(hist.index[-1].date())}
+        del hist
+        set_cached_market_data(cache_key, result, "yf")
+        return result
     except Exception:
         return None
+
+
+def fetch_market_data_yf(ticker):
+    history = fetch_closes_yf(ticker)
+    if not history or len(history["closes"]) < 2:
+        return None
+    closes = history["closes"]
+    latest_price = closes[-1]
+    prev_price = closes[-2]
+    change_percent = f"{((latest_price - prev_price) / prev_price) * 100:.2f}%" if prev_price else None
+    return {
+        "price": round(latest_price, 2),
+        "change_percent": change_percent,
+        "rsi": compute_rsi(closes),
+        "as_of": history["as_of"]
+    }
 
 
 TICKER_BAR_SYMBOLS = [
@@ -655,7 +677,7 @@ def fetch_live_financial_news():
             for entry in feed.entries[:5]:
                 if entry.title not in state.processed_headlines:
                     new_headlines_found.append(entry.title)
-                    state.processed_headlines.add(entry.title)
+                    state.processed_headlines[entry.title] = None
                     # entry.published_parsed is a UTC struct_time whenever the feed
                     # supplies a <pubDate>/<published> element (confirmed present on
                     # all 5 sources below). This is the article's real publish time,
@@ -675,8 +697,19 @@ def fetch_live_financial_news():
         except Exception:
             continue
     if new_headlines_found:
+        # Bound the in-memory copies too, not just what gets persisted — otherwise they grow
+        # for the life of the process on Render's 512MB instance.
+        _trim_oldest(state.processed_headlines, MAX_STORED_HEADLINES)
+        _trim_oldest(state.headline_metadata, MAX_HEADLINE_METADATA)
         save_processed_headlines(state.processed_headlines)
     return new_headlines_found
+
+
+def _trim_oldest(d, max_size):
+    excess = len(d) - max_size
+    if excess > 0:
+        for key in list(itertools.islice(d, excess)):
+            del d[key]
 
 
 def sentiment_confidence(sentiment):
@@ -787,6 +820,8 @@ def run_pipeline_cycle():
         "Article Link": source_meta.get("link")
     }
     state.trade_history.insert(0, new_alert)
+    del state.trade_history[MAX_STORED_ALERTS:]
+    state.headline_metadata.pop(headline, None)
     save_trade_history(state.trade_history)
     return new_alert
 
@@ -816,20 +851,11 @@ def compute_market_regime(lookback=20):
 # --- PRICE HISTORY (for sparkline charts) ---
 def fetch_price_history(ticker, points=20):
     """Last `points` daily closes for a symbol — used for the small sparkline charts on
-    the Market Data screen. Cached alongside the regular market data cache."""
-    cache_key = f"HISTORY:{ticker}:{points}"
-    cached = get_cached_market_data(cache_key)
-    if cached:
-        return cached
-    try:
-        hist = yf.Ticker(ticker).history(period="3mo", timeout=10)
-        if hist.empty:
-            return None
-        closes = [round(float(c), 2) for c in hist["Close"].tolist()[-points:]]
-        set_cached_market_data(cache_key, closes, "yf")
-        return closes
-    except Exception:
+    the Market Data screen. Reuses the same cached download as fetch_market_data_yf."""
+    history = fetch_closes_yf(ticker)
+    if not history:
         return None
+    return [round(c, 2) for c in history["closes"][-points:]]
 
 
 # --- CATEGORIZED MARKET DATA (Indices / Commodities / Forex / Bonds) ---
@@ -926,7 +952,8 @@ def fetch_sector_performance(timeframe="1D"):
         if not closes:
             try:
                 hist = yf.Ticker(etf_symbol).history(period="1y", timeout=10)
-                closes = hist["Close"].tolist() if not hist.empty else None
+                closes = [float(c) for c in hist["Close"].tolist()] if not hist.empty else None
+                del hist
                 if closes:
                     set_cached_market_data(cache_key, closes, "yf")
             except Exception:
@@ -1010,7 +1037,12 @@ def prefetch_all_market_data():
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         ticker_futures = {executor.submit(fetch_ticker_bar_data, symbol): (symbol, label) for symbol, label in TICKER_BAR_SYMBOLS}
         category_futures = {executor.submit(fetch_market_data_category, category): category for category in MARKET_DATA_CATEGORIES}
-        sector_futures = {executor.submit(fetch_sector_performance, tf): tf for tf in TIMEFRAME_LOOKBACK_TRADING_DAYS}
+        # One task for all timeframes, run sequentially: the first one downloads the 12 1-year
+        # ETF histories and the rest hit that cache. Submitting one task per timeframe made all
+        # four race on a cold cache and download the same histories up to 4x concurrently.
+        sector_future = executor.submit(
+            lambda: {tf: fetch_sector_performance(tf) for tf in TIMEFRAME_LOOKBACK_TRADING_DAYS}
+        )
         watchlist_future = executor.submit(fetch_watchlist_quotes)
 
         new_ticker_bar = []
@@ -1033,12 +1065,10 @@ def prefetch_all_market_data():
             except Exception as e:
                 report_error("Market data prefetch (category)", e)
 
-        for future in concurrent.futures.as_completed(sector_futures):
-            timeframe = sector_futures[future]
-            try:
-                state.cached_sectors[timeframe] = future.result()
-            except Exception as e:
-                report_error("Market data prefetch (sectors)", e)
+        try:
+            state.cached_sectors.update(sector_future.result())
+        except Exception as e:
+            report_error("Market data prefetch (sectors)", e)
 
         try:
             state.cached_watchlist = watchlist_future.result()
@@ -1046,3 +1076,6 @@ def prefetch_all_market_data():
             report_error("Market data prefetch (watchlist)", e)
 
     state.cache_last_updated = time.time()
+    # Each cycle churns through dozens of short-lived yfinance/pandas objects; collect them
+    # now rather than letting cyclic garbage pile up between automatic GC passes.
+    gc.collect()
