@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import feedparser
 import requests
@@ -39,6 +39,9 @@ MAX_STORED_HEADLINES = 5000
 # Metadata is only needed until a headline is analyzed; ones the filter rejects would
 # otherwise linger forever.
 MAX_HEADLINE_METADATA = 500
+# Signals and seen-headlines older than this are deleted from memory and Upstash. Checked
+# once a day (and at startup), so data is gone within a day of turning 7 days old.
+RETENTION_DAYS = 7
 DEFAULT_WATCHLIST = [
     {"symbol": "NDAQ", "label": "NDAQ"},
     {"symbol": "MS", "label": "MS"},
@@ -103,6 +106,36 @@ class PipelineState:
             self.av_calls_today = 0
             self.market_data_cache = {}
             self.symbol_cache = {}
+            prune_old_data()
+
+
+def _alert_time(alert):
+    """Parses an alert's UTC ISO Timestamp. Alerts from before the switch to ISO timestamps
+    stored only a time-of-day with no date — they return None and are treated as expired."""
+    try:
+        return datetime.fromisoformat(alert.get("Timestamp", "").removesuffix("Z"))
+    except (TypeError, ValueError):
+        return None
+
+
+def prune_old_data():
+    """Deletes signals and seen-headline markers older than RETENTION_DAYS, in memory and
+    in Upstash, so neither grows indefinitely."""
+    cutoff = datetime.utcnow() - timedelta(days=RETENTION_DAYS)
+    kept_alerts = [a for a in state.trade_history if (_alert_time(a) or datetime.min) >= cutoff]
+    if len(kept_alerts) != len(state.trade_history):
+        removed = len(state.trade_history) - len(kept_alerts)
+        state.trade_history = kept_alerts
+        save_trade_history(kept_alerts)
+        print(f"[pipeline] Pruned {removed} signals older than {RETENTION_DAYS} days")
+
+    cutoff_epoch = time.time() - RETENTION_DAYS * 86400
+    kept_headlines = {t: seen for t, seen in state.processed_headlines.items() if seen >= cutoff_epoch}
+    if len(kept_headlines) != len(state.processed_headlines):
+        removed = len(state.processed_headlines) - len(kept_headlines)
+        state.processed_headlines = kept_headlines
+        save_processed_headlines(kept_headlines)
+        print(f"[pipeline] Pruned {removed} seen-headlines older than {RETENTION_DAYS} days")
 
 
 def load_trade_history():
@@ -116,13 +149,18 @@ def save_trade_history(history):
 
 
 def load_processed_headlines():
-    # A dict (insertion-ordered) rather than a set, so trimming keeps the NEWEST headlines —
-    # list(set)[-N:] dropped an arbitrary subset instead.
-    return dict.fromkeys(storage.redis_get_json("processed_headlines", []))
+    """title -> epoch seconds first seen. Insertion-ordered dict so trimming keeps the NEWEST
+    headlines, and timestamped so prune_old_data() can expire them. Older deployments stored
+    a plain list of titles; those get stamped "now" and age out normally from there."""
+    stored = storage.redis_get_json("processed_headlines", {})
+    if isinstance(stored, list):
+        now = time.time()
+        return {title: now for title in stored}
+    return stored
 
 
 def save_processed_headlines(headlines):
-    trimmed = list(headlines)[-MAX_STORED_HEADLINES:]
+    trimmed = dict(itertools.islice(headlines.items(), max(0, len(headlines) - MAX_STORED_HEADLINES), None))
     if not storage.redis_set_json("processed_headlines", trimmed):
         report_error("Persisting seen-headlines", "Upstash write failed")
 
@@ -144,6 +182,7 @@ def report_error(source, message):
 
 
 state = PipelineState()
+prune_old_data()
 
 
 def call_llm(prompt, temperature=0.0):
@@ -676,19 +715,20 @@ def fetch_live_financial_news():
             feed = feedparser.parse(url)
             for entry in feed.entries[:5]:
                 if entry.title not in state.processed_headlines:
-                    new_headlines_found.append(entry.title)
-                    state.processed_headlines[entry.title] = None
                     # entry.published_parsed is a UTC struct_time whenever the feed
                     # supplies a <pubDate>/<published> element (confirmed present on
                     # all 5 sources below). This is the article's real publish time,
                     # not when our pipeline got around to analyzing it — falls back
                     # to "now" only if a feed is ever missing it.
                     published_struct = getattr(entry, "published_parsed", None)
-                    published_at = (
-                        datetime(*published_struct[:6]).isoformat() + "Z"
-                        if published_struct
-                        else datetime.utcnow().isoformat() + "Z"
-                    )
+                    published_dt = datetime(*published_struct[:6]) if published_struct else datetime.utcnow()
+                    state.processed_headlines[entry.title] = time.time()
+                    # Its seen-marker may have been pruned already, so without this a
+                    # stale article still sitting in a feed would be analyzed again.
+                    if published_dt < datetime.utcnow() - timedelta(days=RETENTION_DAYS):
+                        continue
+                    new_headlines_found.append(entry.title)
+                    published_at = published_dt.isoformat() + "Z"
                     state.headline_metadata[entry.title] = {
                         "link": getattr(entry, "link", None),
                         "source": RSS_SOURCE_NAMES.get(url, "Unknown source"),
