@@ -45,12 +45,25 @@ GROQ_FAST_MODEL = "openai/gpt-oss-20b"
 GROQ_DEEP_MODEL = "openai/gpt-oss-120b"
 GROQ_BACKUP_MODEL = "qwen/qwen3.8-27b"  # no hidden reasoning, so very few tokens per call
 GROQ_DAILY_TOKEN_LIMIT = 200_000
+# qwen's free tier also caps output at 1,000 tokens/minute and rejects any request whose
+# expected output exceeds that (seen live on deep analyses), so its output is capped. It
+# writes no hidden reasoning, so a cap is safe for it, unlike the gpt-oss models.
+QWEN_PARAMS = {"max_tokens": 900}
+# Each tier's chain avoids the other tier's primary model, so running out in one stage
+# can't drain the other's daily allowance (seen live: deep analysis fell back onto 20b and
+# used up triage's tokens). Gemini and OpenRouter are separate free quotas.
 AI_TIERS = {
-    # Triage: scores ~20 headlines per call. Measured ~1.1K tokens per batch on 20b at low effort.
-    "fast": [(GROQ_FAST_MODEL, {"reasoning_effort": "low"}), (GROQ_BACKUP_MODEL, {}), (GROQ_DEEP_MODEL, {"reasoning_effort": "low"})],
-    # Deep analysis, only for high-impact headlines.
-    "deep": [(GROQ_DEEP_MODEL, {}), (GROQ_BACKUP_MODEL, {}), (GROQ_FAST_MODEL, {})],
+    # Triage: scores up to 20 headlines per call. ~1.1K tokens per batch on 20b at low effort.
+    "fast": [(GROQ_FAST_MODEL, {"reasoning_effort": "low"}), (GROQ_BACKUP_MODEL, QWEN_PARAMS), "gemini", "openrouter"],
+    # Deep analysis, only for high-impact headlines. Gemini before qwen: a deep answer is
+    # close to qwen's per-minute output cap.
+    "deep": [(GROQ_DEEP_MODEL, {}), "gemini", (GROQ_BACKUP_MODEL, QWEN_PARAMS), "openrouter"],
 }
+# Triage waits until it has this many headlines, or until the oldest has waited this long.
+# Each call carries ~1K tokens of fixed cost (instructions plus hidden reasoning), and
+# triaging the 1-3 headlines each 20s scan brings spent 20b's daily allowance in hours.
+TRIAGE_MIN_BATCH = 10
+TRIAGE_MAX_WAIT_SECONDS = 120
 # Triage impact scores (1-10): below QUICK the headline is dropped; from QUICK up it becomes
 # a quick signal straight from the triage answer (no extra AI call); from DEEP up it gets a
 # full deep analysis. DEEP rises to DEEP_IMPACT_WHEN_LOW_BUDGET once the deep model has used
@@ -310,74 +323,89 @@ def deep_impact_threshold():
     return DEEP_ANALYSIS_MIN_IMPACT
 
 
+def _call_groq(model, extra_params, prompt, temperature):
+    try:
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            **extra_params,
+        )
+    except Exception as e:
+        report_error(f"Groq {model}", e)
+        _mark_unavailable(model, e, getattr(e, "status_code", None))
+        return None
+    tokens = completion.usage.total_tokens if completion.usage else 0
+    state.groq_tokens_today += tokens
+    state.model_tokens_today[model] = state.model_tokens_today.get(model, 0) + tokens
+    return (completion.choices[0].message.content or "").strip() or None
+
+
+def _call_gemini(prompt, temperature):
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            # Key in a header, not ?key=: requests puts the URL in its error messages, and
+            # errors are served by the public /api/errors and /api/usage endpoints.
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": temperature}
+            },
+            timeout=20
+        )
+        response.raise_for_status()
+        payload = response.json()
+        usage = payload.get("usageMetadata", {})
+        if usage:
+            state.gemini_tokens_today += usage.get("totalTokenCount", 0)
+        return payload["candidates"][0]["content"]["parts"][0]["text"].strip() or None
+    except Exception as e:
+        report_error("Gemini", e)
+        _mark_unavailable("gemini", e, getattr(getattr(e, "response", None), "status_code", None))
+        return None
+
+
+def _call_openrouter(prompt, temperature):
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
+            timeout=20
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("usage"):
+            state.openrouter_tokens_today += payload["usage"].get("total_tokens", 0)
+        return payload["choices"][0]["message"]["content"].strip() or None
+    except Exception as e:
+        report_error("OpenRouter", e)
+        _mark_unavailable("openrouter", e, getattr(getattr(e, "response", None), "status_code", None))
+        return None
+
+
 def call_llm(prompt, tier="deep", temperature=0.0):
-    """Tries the tier's Groq models in order (each has its own free daily allowance), then
-    Gemini, then OpenRouter. A model that hits its rate limit is skipped until the limit
-    lifts instead of being retried on every call. Returns None only if all are unavailable.
-    No max_tokens cap — gpt-oss models spend a large, variable amount of their budget on
-    hidden reasoning before the visible answer; capping output length caused them to hit
-    the limit mid-thought and return empty responses."""
+    """Tries the tier's providers in order (see AI_TIERS). A model that hits its rate limit
+    is skipped until the limit lifts instead of being retried on every call. Returns None
+    only if all are unavailable. No max_tokens cap on gpt-oss models — they spend a large,
+    variable amount of their budget on hidden reasoning before the visible answer; capping
+    output length caused them to hit the limit mid-thought and return empty responses."""
     if time.time() < state.ai_unavailable_until:
         return None
 
-    for model, extra_params in AI_TIERS[tier]:
-        if not _provider_available(model):
+    for provider in AI_TIERS[tier]:
+        name = provider[0] if isinstance(provider, tuple) else provider
+        if not _provider_available(name):
             continue
-        try:
-            completion = groq_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                **extra_params,
-            )
-            tokens = completion.usage.total_tokens if completion.usage else 0
-            state.groq_tokens_today += tokens
-            state.model_tokens_today[model] = state.model_tokens_today.get(model, 0) + tokens
-            content = (completion.choices[0].message.content or "").strip()
-            if content:
-                return content
-        except Exception as e:
-            report_error(f"Groq {model}", e)
-            _mark_unavailable(model, e, getattr(e, "status_code", None))
-
-    if GEMINI_API_KEY and _provider_available("gemini"):
-        try:
-            response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                params={"key": GEMINI_API_KEY},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": temperature}
-                },
-                timeout=20
-            )
-            response.raise_for_status()
-            payload = response.json()
-            usage = payload.get("usageMetadata", {})
-            if usage:
-                state.gemini_tokens_today += usage.get("totalTokenCount", 0)
-            return payload["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as e2:
-            report_error("Gemini fallback", e2)
-            _mark_unavailable("gemini", e2, getattr(getattr(e2, "response", None), "status_code", None))
-
-    # Free OpenRouter models allow only 50 requests/day, so this is a last resort.
-    if OPENROUTER_API_KEY and _provider_available("openrouter"):
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                json={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
-                timeout=20
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("usage"):
-                state.openrouter_tokens_today += payload["usage"].get("total_tokens", 0)
-            return payload["choices"][0]["message"]["content"].strip()
-        except Exception as e3:
-            report_error("OpenRouter fallback", e3)
-            _mark_unavailable("openrouter", e3, getattr(getattr(e3, "response", None), "status_code", None))
+        if name == "gemini":
+            content = _call_gemini(prompt, temperature) if GEMINI_API_KEY else None
+        elif name == "openrouter":
+            content = _call_openrouter(prompt, temperature) if OPENROUTER_API_KEY else None
+        else:
+            content = _call_groq(name, provider[1], prompt, temperature)
+        if content:
+            return content
 
     state.ai_unavailable_until = time.time() + AI_COOLDOWN_SECONDS
     print(f"[pipeline] All AI providers unavailable — pausing analysis for {AI_COOLDOWN_SECONDS}s")
@@ -1232,6 +1260,7 @@ def fetch_live_financial_news():
                 "source": publisher if publisher and publisher != source["name"] else source["name"],
                 "region": source["region"],
                 "published_at": published_dt.isoformat() + "Z",
+                "queued_at": now,
             }
 
     if marked_any:
@@ -1321,7 +1350,9 @@ def run_pipeline_cycle():
     state.qualified_headlines = [h for h in state.qualified_headlines if _headline_published(h) >= cutoff]
     state.pending_headlines = [h for h in state.pending_headlines if _headline_published(h) >= cutoff]
 
-    if not state.qualified_headlines and state.pending_headlines and time.time() >= state.ai_unavailable_until:
+    oldest_wait = max((now - state.headline_metadata.get(h, {}).get("queued_at", now) for h in state.pending_headlines), default=0)
+    triage_due = len(state.pending_headlines) >= TRIAGE_MIN_BATCH or oldest_wait >= TRIAGE_MAX_WAIT_SECONDS
+    if not state.qualified_headlines and triage_due and time.time() >= state.ai_unavailable_until:
         # Newest first: the freshest news is the most tradeable.
         state.pending_headlines.sort(key=_headline_published, reverse=True)
         batch = state.pending_headlines[:BATCH_FILTER_SIZE]
