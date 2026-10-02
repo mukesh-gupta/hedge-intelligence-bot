@@ -1,13 +1,23 @@
 import collections
 import concurrent.futures
 import gc
+import gzip
+import hashlib
+import html
 import itertools
 import json
 import os
 import re
+import ssl
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
+import certifi
 import feedparser
 import requests
 import yfinance as yf
@@ -1005,10 +1015,17 @@ NEWS_SOURCES = [
     {"name": "Finnhub Crypto", "finnhub_category": "crypto", "region": "Crypto", "every": 60},
 ]
 
-_http = requests.Session()
-_http.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+_FEED_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+# One TLS context for every feed request. requests re-loads its CA bundle for each new
+# connection, and news servers close idle connections between scans, so ~43 polls per
+# scan each paid that cost — measured ~70x more CPU than urllib with this shared context,
+# enough to starve request handling on Render's fractional free-tier CPU.
+# certifi's bundle (what requests used) rather than the OS store, which lacks some feeds'
+# roots on some platforms (ECB failed verification against the Windows store).
+_FEED_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 _source_last_polled = {}
 _feed_validators = {}  # url -> ETag / Last-Modified, for conditional GETs
+_feed_body_hashes = {}  # url -> hash of the last body parsed, for feeds without validators
 _undated_titles = {}  # source name -> undated titles seen on its previous poll
 _recent_story_tokens = collections.deque(maxlen=2000)  # (accepted_at, word set) for dedup
 _DEDUP_STOPWORDS = frozenset(
@@ -1017,10 +1034,87 @@ _DEDUP_STOPWORDS = frozenset(
 )
 
 
+def _xml_name(tag):
+    return tag.rsplit("}", 1)[-1]  # drop any XML namespace
+
+
+def _parse_utc(text):
+    """RFC 822 (RSS) or ISO 8601 (Atom) date -> naive UTC. None if unparseable or if it
+    has no timezone, since a zone-less time can't be placed (RBI's are IST, unlabeled)."""
+    try:
+        dt = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_feed_fast(body):
+    """Extracts just (title, link, published, publisher) per item with the C-accelerated
+    XML parser — measured 14-37x less CPU than feedparser, which sanitizes every field of
+    every entry. That matters on Render's free fractional CPU, where feedparser parsing all
+    feeds every scan starved request handling (observed: /api/status timing out at 30s).
+    Returns None — meaning "use feedparser" — for anything it can't handle with certainty."""
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return None
+    items = []
+    for element in root.iter():
+        if _xml_name(element.tag) not in ("item", "entry"):
+            continue
+        title = link = date_text = publisher = None
+        for child in element:
+            name = _xml_name(child.tag)
+            if name == "title":
+                title = "".join(child.itertext())
+            elif name == "link":
+                link = child.get("href") or (child.text or "").strip() or link
+            elif name in ("pubDate", "published", "date") or (name == "updated" and not date_text):
+                date_text = (child.text or "").strip() or date_text
+            elif name == "source":
+                publisher = (child.text or "").strip() or None
+        published = _parse_utc(date_text) if date_text else None
+        if date_text and published is None:
+            return None  # a date we can't place with certainty: let feedparser decide
+        items.append((title or "", link, published, publisher))
+    return items
+
+
+def _parse_feed_slow(body):
+    items = []
+    for entry in feedparser.parse(body).entries:
+        # published_parsed is UTC — the article's real publish time, not when we saw it.
+        published = entry.get("published_parsed") or entry.get("updated_parsed")
+        items.append((entry.get("title", ""), entry.get("link"), datetime(*published[:6]) if published else None,
+                      entry.get("source", {}).get("title")))
+    return items
+
+
+def _http_get(url, headers=None):
+    """GET -> (body, response headers), or (None, None) on 304 Not Modified. Raises on
+    other HTTP errors and network failures."""
+    request = urllib.request.Request(url, headers={"User-Agent": _FEED_USER_AGENT, **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=FEED_TIMEOUT_SECONDS, context=_FEED_SSL_CONTEXT) as resp:
+            body = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                body = gzip.decompress(body)
+            return body, resp.headers
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return None, None
+        raise
+
+
 def _fetch_rss(source):
     """Returns [(title, link, published_utc_or_None, publisher_or_None)], or None if the
-    feed is unchanged since the last poll. Conditional GET means an unchanged feed costs a
-    tiny 304 instead of a full download and re-parse every scan."""
+    feed is unchanged since the last poll — either a 304 from a conditional GET, or a body
+    byte-identical to the last one parsed (for feeds that don't support conditional GETs)."""
     url = source["url"]
     validators = _feed_validators.get(url, {})
     headers = {}
@@ -1028,36 +1122,36 @@ def _fetch_rss(source):
         headers["If-None-Match"] = validators["etag"]
     if validators.get("modified"):
         headers["If-Modified-Since"] = validators["modified"]
-    resp = _http.get(url, headers=headers, timeout=FEED_TIMEOUT_SECONDS)
-    if resp.status_code == 304:
+    body, resp_headers = _http_get(url, headers)
+    if body is None:
         return None
-    resp.raise_for_status()
-    _feed_validators[url] = {"etag": resp.headers.get("ETag"), "modified": resp.headers.get("Last-Modified")}
-    feed = feedparser.parse(resp.content)
+    _feed_validators[url] = {"etag": resp_headers.get("ETag"), "modified": resp_headers.get("Last-Modified")}
+    body_hash = hashlib.blake2b(body, digest_size=16).digest()
+    if _feed_body_hashes.get(url) == body_hash:
+        return None
+    _feed_body_hashes[url] = body_hash
+
+    raw_items = _parse_feed_fast(body)
+    if raw_items is None:
+        raw_items = _parse_feed_slow(body)
     items = []
-    for entry in feed.entries:
-        title = " ".join(entry.get("title", "").split())
+    for title, link, published, publisher in raw_items:
+        # Some feeds double-escape entities ("M&amp;M"); unescape once more and tidy spaces.
+        title = " ".join(html.unescape(title).split())
         if not title:
             continue
         # Google News titles end in " - Reuters" etc.; keep the publisher, drop the suffix.
-        publisher = entry.get("source", {}).get("title")
         if publisher and title.endswith(f" - {publisher}"):
             title = title[: -len(publisher) - 3]
-        # published_parsed is UTC — the article's real publish time, not when we saw it.
-        published = entry.get("published_parsed") or entry.get("updated_parsed")
-        items.append((title, entry.get("link"), datetime(*published[:6]) if published else None, publisher))
+        items.append((title, link, published, publisher))
     return items
 
 
 def _fetch_finnhub(source):
-    resp = _http.get(
-        "https://finnhub.io/api/v1/news",
-        params={"category": source["finnhub_category"], "token": FINNHUB_API_KEY},
-        timeout=FEED_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
+    query = urllib.parse.urlencode({"category": source["finnhub_category"], "token": FINNHUB_API_KEY})
+    body, _ = _http_get(f"https://finnhub.io/api/v1/news?{query}")
     items = []
-    for article in resp.json():
+    for article in json.loads(body or b"[]"):
         title = " ".join((article.get("headline") or "").split())
         if not title:
             continue

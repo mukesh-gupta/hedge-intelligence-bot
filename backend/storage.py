@@ -6,6 +6,11 @@ import requests
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
+# Reuses one kept-alive connection: a fresh TLS connection per call (what module-level
+# requests.get/post does) re-loads the CA bundle each time, which is costly on Render's
+# fractional free-tier CPU.
+_session = requests.Session()
+
 
 def is_configured() -> bool:
     return bool(UPSTASH_URL and UPSTASH_TOKEN)
@@ -23,7 +28,7 @@ def redis_get_json(key, default):
     if not is_configured():
         return default
     try:
-        resp = requests.get(f"{UPSTASH_URL}/get/{key}", headers=_headers(), timeout=10)
+        resp = _session.get(f"{UPSTASH_URL}/get/{key}", headers=_headers(), timeout=10)
         resp.raise_for_status()
         result = resp.json().get("result")
         return default if result is None else json.loads(result)
@@ -38,7 +43,7 @@ def redis_pipeline(commands):
     if not is_configured() or not commands:
         return None
     try:
-        resp = requests.post(f"{UPSTASH_URL}/pipeline", headers=_headers(), data=json.dumps(commands), timeout=15)
+        resp = _session.post(f"{UPSTASH_URL}/pipeline", headers=_headers(), data=json.dumps(commands), timeout=15)
         resp.raise_for_status()
         replies = resp.json()
         if any("error" in r for r in replies):
@@ -55,7 +60,7 @@ def redis_set_json(key, value) -> bool:
     if not is_configured():
         return False
     try:
-        resp = requests.post(
+        resp = _session.post(
             f"{UPSTASH_URL}/set/{key}",
             headers=_headers(),
             data=json.dumps(value),
