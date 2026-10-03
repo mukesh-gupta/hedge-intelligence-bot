@@ -64,6 +64,14 @@ AI_TIERS = {
 # triaging the 1-3 headlines each 20s scan brings spent 20b's daily allowance in hours.
 TRIAGE_MIN_BATCH = 10
 TRIAGE_MAX_WAIT_SECONDS = 120
+# Fast lane: a headline from a "priority" source (see NEWS_SOURCES) triggers triage right
+# away instead of waiting for a batch — everything else queued rides along in the same call.
+# Rate-limited, and switched off once the triage model has used most of its daily allowance,
+# so speed never costs the bot its ability to triage for the rest of the day.
+FAST_LANE_MIN_INTERVAL_SECONDS = 45
+# Set by triage from the headline itself. The feed a story arrived on is only a fallback:
+# commodity and forex feeds carry plenty of general news.
+SIGNAL_REGIONS = ("Global", "India", "Commodities", "Forex", "Crypto")
 # Triage impact scores (1-10): below QUICK the headline is dropped; from QUICK up it becomes
 # a quick signal straight from the triage answer (no extra AI call); from DEEP up it gets a
 # full deep analysis. DEEP rises to DEEP_IMPACT_WHEN_LOW_BUDGET once the deep model has used
@@ -147,6 +155,7 @@ class PipelineState:
         self.ai_unavailable_until = 0
         self.model_unavailable_until = {}  # model/provider -> epoch when its rate limit lifts
         self.last_scan_time = 0
+        self.last_fast_lane_triage = 0
         self.headlines_saved_at = 0
 
         # Runtime-adjustable settings — mutable via PATCH /api/settings instead of being
@@ -550,30 +559,31 @@ def is_market_relevant(headline):
 
 def triage_headlines(headlines):
     """One cheap AI call scores a whole batch. Returns {headline: {"impact", "direction",
-    "tickers", "sector"}} for headlines scoring at least QUICK_SIGNAL_MIN_IMPACT ({} if none
-    do), or None if every AI provider is unavailable — so the caller can requeue the batch."""
+    "region", "tickers", "sector"}} for headlines scoring at least QUICK_SIGNAL_MIN_IMPACT
+    ({} if none do), or None if every AI provider is unavailable — so the caller can requeue
+    the batch. The prompt is kept short on purpose: it is paid for on every call, and with
+    the fast lane many calls carry only a few headlines."""
     if not headlines:
         return {}
     numbered = "\n".join(f"{i + 1}. {h}" for i, h in enumerate(headlines))
-    prompt = f"""Below are {len(headlines)} news headlines from global, Indian, commodity, forex and
-crypto news feeds. Score each one for how much it is likely to move a stock, sector, index,
-currency, bond yield, commodity or crypto price today. Indian market news (Sensex/Nifty, RBI,
-SEBI, the rupee, large Indian companies) counts just as much as US news.
+    prompt = f"""Score these {len(headlines)} news headlines for likely same-day impact on a stock, sector,
+index, currency, bond yield, commodity or crypto price. Indian markets (Sensex/Nifty, RBI, SEBI,
+rupee, large Indian companies) count as much as US ones.
 
-impact (1-10): 10 = market-wide shock (surprise central bank move, war escalation, crash);
-8-9 = major move for a large company, sector, commodity or currency (earnings/guidance surprise,
-big M&A, regulatory action, supply shock); 6-7 = clear but limited price impact; 4-5 = minor.
-Opinion/commentary, personal-finance advice, listicles, previews of scheduled events with no new
-information, recaps of moves with no new cause, and news with no plausible price impact score 1-3.
+impact 1-10: 10 = market-wide shock; 8-9 = major move for a large company, sector, commodity or
+currency (earnings/guidance surprise, big M&A, central bank or regulatory action, supply shock);
+6-7 = clear but limited impact; 4-5 = minor. Opinion, advice, listicles, previews, recaps with no
+new cause, and news with no plausible price impact score 1-3.
 
 {numbered}
 
-For each headline scoring {QUICK_SIGNAL_MIN_IMPACT} or more, output one object:
-{{"n": <headline number>, "impact": <1-10>, "direction": "BULLISH" or "BEARISH" or "MIXED",
-"tickers": [up to 3 exchange-listed symbols most affected, in Yahoo Finance format such as AAPL,
-RELIANCE.NS, ^NSEI, GC=F, CL=F, EURUSD=X, BTC-USD — use [] if the company is private or you are
-not sure of the symbol; never guess], "sector": "<short sector name>"}}
-Respond with ONLY a JSON array of these objects and nothing else. If none qualify, respond with []."""
+Output ONLY a JSON array, one object per headline scoring {QUICK_SIGNAL_MIN_IMPACT}+ ([] if none):
+{{"n": headline number, "impact": 1-10, "direction": "BULLISH"|"BEARISH"|"MIXED",
+"region": "India"|"Commodities"|"Forex"|"Crypto"|"Global", "tickers": [up to 3 Yahoo Finance
+symbols, e.g. AAPL, RELIANCE.NS, ^NSEI, GC=F, EURUSD=X, BTC-USD; [] if private or unsure, never
+guess], "sector": "short name"}}
+region = the market mainly affected: India (Indian stocks, indices, RBI, rupee), Commodities (oil,
+gas, metals, crops), Forex (currencies), Crypto, otherwise Global."""
     raw_text = call_llm(prompt, tier="fast")
     if raw_text is None:
         return None
@@ -592,9 +602,12 @@ Respond with ONLY a JSON array of these objects and nothing else. If none qualif
         if not 1 <= n <= len(headlines) or impact < QUICK_SIGNAL_MIN_IMPACT:
             continue
         direction = str(item.get("direction", "")).upper()
+        region = str(item.get("region", "")).title()
         triaged[headlines[n - 1]] = {
             "impact": min(impact, 10),
             "direction": direction if direction in ("BULLISH", "BEARISH") else "MIXED",
+            # None when the AI gives nothing usable: the alert falls back to the feed's region.
+            "region": region if region in SIGNAL_REGIONS else None,
             "tickers": [str(t).strip() for t in (item.get("tickers") or []) if str(t).strip()][:3],
             "sector": item.get("sector") or "General Markets",
         }
@@ -985,20 +998,22 @@ def run_deep_analysis(headline, sector, resolved_ticker):
 
 
 # "every" = minimum seconds between polls of that source (0 = every scan). Slow-moving or
-# rate-limit-sensitive sources (Google News, central banks) are polled less often.
+# rate-limit-sensitive sources (Google News) are polled less often.
+# "priority" = its headlines take the triage fast lane (see FAST_LANE_MIN_INTERVAL_SECONDS):
+# the wires and central banks, where being a couple of minutes late matters most.
 # Checked live: Moneycontrol's feeds are years stale, Kitco's 404s, so neither is listed.
 NEWS_SOURCES = [
     # Global markets and economy
-    {"name": "Bloomberg Markets", "url": "https://feeds.bloomberg.com/markets/news.rss", "region": "Global"},
-    {"name": "Bloomberg Economics", "url": "https://feeds.bloomberg.com/economics/news.rss", "region": "Global"},
+    {"name": "Bloomberg Markets", "url": "https://feeds.bloomberg.com/markets/news.rss", "region": "Global", "priority": True},
+    {"name": "Bloomberg Economics", "url": "https://feeds.bloomberg.com/economics/news.rss", "region": "Global", "priority": True},
     {"name": "Bloomberg Politics", "url": "https://feeds.bloomberg.com/politics/news.rss", "region": "Global", "every": 60},
     {"name": "Bloomberg Technology", "url": "https://feeds.bloomberg.com/technology/news.rss", "region": "Global", "every": 60},
-    {"name": "CNBC", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "region": "Global"},
+    {"name": "CNBC", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "region": "Global", "priority": True},
     {"name": "CNBC World", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "region": "Global"},
     {"name": "CNBC Finance", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "region": "Global"},
     {"name": "CNBC Earnings", "url": "https://www.cnbc.com/id/15839135/device/rss/rss.html", "region": "Global", "every": 60},
     {"name": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories", "region": "Global"},
-    {"name": "MarketWatch Bulletins", "url": "https://feeds.content.dowjones.io/public/rss/mw_bulletins", "region": "Global"},
+    {"name": "MarketWatch Bulletins", "url": "https://feeds.content.dowjones.io/public/rss/mw_bulletins", "region": "Global", "priority": True},
     {"name": "WSJ Markets", "url": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain", "region": "Global"},
     {"name": "WSJ World", "url": "https://feeds.content.dowjones.io/public/rss/RSSWorldNews", "region": "Global", "every": 60},
     {"name": "Financial Times", "url": "https://www.ft.com/markets?format=rss", "region": "Global"},
@@ -1008,10 +1023,10 @@ NEWS_SOURCES = [
     {"name": "Investing.com Indicators", "url": "https://www.investing.com/rss/news_95.rss", "region": "Global"},
     {"name": "Seeking Alpha", "url": "https://seekingalpha.com/market_currents.xml", "region": "Global"},
     {"name": "Benzinga", "url": "https://www.benzinga.com/feed", "region": "Global", "every": 60},
-    {"name": "Reuters (Google News)", "url": "https://news.google.com/rss/search?q=site:reuters.com+markets+when:1h&hl=en-US&gl=US&ceid=US:en", "region": "Global", "every": 180},
-    {"name": "Reuters Business (Google News)", "url": "https://news.google.com/rss/search?q=site:reuters.com+business+when:1h&hl=en-US&gl=US&ceid=US:en", "region": "Global", "every": 180},
-    {"name": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "region": "Global", "every": 300},
-    {"name": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html", "region": "Global", "every": 300},
+    {"name": "Reuters (Google News)", "url": "https://news.google.com/rss/search?q=site:reuters.com+markets+when:1h&hl=en-US&gl=US&ceid=US:en", "region": "Global", "every": 120, "priority": True},
+    {"name": "Reuters Business (Google News)", "url": "https://news.google.com/rss/search?q=site:reuters.com+business+when:1h&hl=en-US&gl=US&ceid=US:en", "region": "Global", "every": 120, "priority": True},
+    {"name": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "region": "Global", "every": 60, "priority": True},
+    {"name": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html", "region": "Global", "every": 60, "priority": True},
     # India
     {"name": "Economic Times Markets", "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms", "region": "India"},
     {"name": "Economic Times Stocks", "url": "https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms", "region": "India"},
@@ -1023,7 +1038,7 @@ NEWS_SOURCES = [
     {"name": "BusinessLine Markets", "url": "https://www.thehindubusinessline.com/markets/feeder/default.rss", "region": "India"},
     {"name": "NDTV Profit", "url": "https://feeds.feedburner.com/ndtvprofit-latest", "region": "India"},
     {"name": "India Markets (Google News)", "url": "https://news.google.com/rss/search?q=sensex+OR+nifty+OR+sebi+OR+rbi+when:1h&hl=en-IN&gl=IN&ceid=IN:en", "region": "India", "every": 180},
-    {"name": "RBI", "url": "https://www.rbi.org.in/pressreleases_rss.xml", "region": "India", "every": 300},
+    {"name": "RBI", "url": "https://www.rbi.org.in/pressreleases_rss.xml", "region": "India", "every": 60, "priority": True},
     # Commodities
     {"name": "Investing.com Commodities", "url": "https://www.investing.com/rss/news_11.rss", "region": "Commodities"},
     {"name": "Economic Times Commodities", "url": "https://economictimes.indiatimes.com/markets/commodities/rssfeeds/1808152121.cms", "region": "Commodities"},
@@ -1259,6 +1274,7 @@ def fetch_live_financial_news():
                 "link": link,
                 "source": publisher if publisher and publisher != source["name"] else source["name"],
                 "region": source["region"],
+                "priority": source.get("priority", False),
                 "published_at": published_dt.isoformat() + "Z",
                 "queued_at": now,
             }
@@ -1350,9 +1366,18 @@ def run_pipeline_cycle():
     state.qualified_headlines = [h for h in state.qualified_headlines if _headline_published(h) >= cutoff]
     state.pending_headlines = [h for h in state.pending_headlines if _headline_published(h) >= cutoff]
 
-    oldest_wait = max((now - state.headline_metadata.get(h, {}).get("queued_at", now) for h in state.pending_headlines), default=0)
-    triage_due = len(state.pending_headlines) >= TRIAGE_MIN_BATCH or oldest_wait >= TRIAGE_MAX_WAIT_SECONDS
+    pending_meta = [state.headline_metadata.get(h, {}) for h in state.pending_headlines]
+    oldest_wait = max((now - m.get("queued_at", now) for m in pending_meta), default=0)
+    fast_lane = (
+        any(m.get("priority") for m in pending_meta)
+        and now - state.last_fast_lane_triage >= FAST_LANE_MIN_INTERVAL_SECONDS
+        and _provider_available(GROQ_FAST_MODEL)
+        and state.model_tokens_today.get(GROQ_FAST_MODEL, 0) < LOW_BUDGET_FRACTION * GROQ_DAILY_TOKEN_LIMIT
+    )
+    triage_due = fast_lane or len(state.pending_headlines) >= TRIAGE_MIN_BATCH or oldest_wait >= TRIAGE_MAX_WAIT_SECONDS
     if not state.qualified_headlines and triage_due and time.time() >= state.ai_unavailable_until:
+        if fast_lane:
+            state.last_fast_lane_triage = now
         # Newest first: the freshest news is the most tradeable.
         state.pending_headlines.sort(key=_headline_published, reverse=True)
         batch = state.pending_headlines[:BATCH_FILTER_SIZE]
@@ -1422,7 +1447,7 @@ def run_pipeline_cycle():
         "Key Takeaways": ai_blueprint.get("key_takeaways", []),
         "Impact": triage.get("impact"),
         "Analysis": "Deep",
-        "Region": source_meta.get("region"),
+        "Region": triage.get("region") or source_meta.get("region"),
         "Source": source_meta.get("source"),
         "Article Link": source_meta.get("link")
     }
@@ -1463,7 +1488,7 @@ def _quick_alert(headline, triage):
         "Key Takeaways": [],
         "Impact": triage["impact"],
         "Analysis": "Quick",
-        "Region": meta.get("region"),
+        "Region": triage.get("region") or meta.get("region"),
         "Source": meta.get("source"),
         "Article Link": meta.get("link"),
     }
