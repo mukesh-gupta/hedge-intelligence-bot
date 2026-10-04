@@ -1,6 +1,7 @@
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
 trade_history.json
 processed_headlines.json
 watchlist.json

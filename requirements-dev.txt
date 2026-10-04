@@ -1,0 +1,3 @@
+# For running the tests (python -m pytest). Not installed on Render.
+pytest
+httpx
