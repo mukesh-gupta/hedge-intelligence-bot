@@ -142,6 +142,9 @@ class PipelineState:
         self.pending_headlines = []
         self.qualified_headlines = []
         self.headline_metadata = {}
+        # Published signals waiting for outcomes.py to record their entry price. Bounded so
+        # it can't grow if that loop stalls; a deque so both threads can use it safely.
+        self.outcome_queue = collections.deque(maxlen=500)
 
         self.token_usage_date = local_today()
         self.groq_tokens_today = 0
@@ -1516,6 +1519,10 @@ def _publish_alert(headline, alert):
     # analyzed at 12:01 AM belongs to the new day; the gap between the two is also how
     # long the bot took to turn the news into a signal.
     alert["Processed At"] = datetime.utcnow().isoformat() + "Z"
+    # Filled in by outcomes.py once the price has been checked. The key exists from the
+    # start so that later updates only replace a value (see outcomes._attach_to_signals).
+    alert["Outcome"] = None
+    state.outcome_queue.append(alert)
     state.trade_history.insert(0, alert)
     del state.trade_history[MAX_STORED_ALERTS:]
     state.headline_metadata.pop(headline, None)

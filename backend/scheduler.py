@@ -3,7 +3,7 @@ import os
 
 import requests
 
-from backend import pipeline
+from backend import outcomes, pipeline
 
 # Ticks fast (the same 5s cadence app.py's fragment used) so any backlog of already-queued
 # headlines drains quickly, while fetch_live_financial_news() itself is only actually
@@ -23,9 +23,14 @@ MARKET_DATA_WARM_SECONDS = 45
 # well inside that window counts as inbound traffic and keeps the bot scanning 24/7.
 KEEPALIVE_SECONDS = 600
 
+# Result tracking: records entry prices for new signals and scores the checks that have
+# come due. A minute's granularity is plenty for 1-hour and 1-day horizons.
+OUTCOME_SECONDS = 60
+
 _pipeline_task = None
 _market_data_task = None
 _keepalive_task = None
+_outcome_task = None
 
 
 async def _pipeline_loop():
@@ -57,6 +62,16 @@ async def _market_data_warm_loop():
         await asyncio.sleep(MARKET_DATA_WARM_SECONDS)
 
 
+async def _outcome_loop():
+    while True:
+        await asyncio.sleep(OUTCOME_SECONDS)
+        try:
+            # Blocking price lookups and an Upstash write: keep them off the event loop.
+            await asyncio.to_thread(outcomes.run_cycle)
+        except Exception as e:
+            pipeline.report_error("Result tracking loop", e)
+
+
 async def _keepalive_loop(base_url):
     while True:
         await asyncio.sleep(KEEPALIVE_SECONDS)
@@ -70,11 +85,13 @@ def start():
     """Launch the background loops on the running event loop. Runs independent of any
     connected HTTP client — this is the point of moving off Streamlit's run_every, which
     only ticked while a browser tab with an open script-run was present."""
-    global _pipeline_task, _market_data_task, _keepalive_task
+    global _pipeline_task, _market_data_task, _keepalive_task, _outcome_task
     if _pipeline_task is None or _pipeline_task.done():
         _pipeline_task = asyncio.create_task(_pipeline_loop())
     if _market_data_task is None or _market_data_task.done():
         _market_data_task = asyncio.create_task(_market_data_warm_loop())
+    if _outcome_task is None or _outcome_task.done():
+        _outcome_task = asyncio.create_task(_outcome_loop())
     # Render sets RENDER_EXTERNAL_URL itself; when running locally it's unset and no ping runs.
     base_url = os.getenv("RENDER_EXTERNAL_URL")
     if base_url and (_keepalive_task is None or _keepalive_task.done()):
@@ -83,8 +100,8 @@ def start():
 
 
 def stop():
-    global _pipeline_task, _market_data_task, _keepalive_task
-    for task in (_pipeline_task, _market_data_task, _keepalive_task):
+    global _pipeline_task, _market_data_task, _keepalive_task, _outcome_task
+    for task in (_pipeline_task, _market_data_task, _keepalive_task, _outcome_task):
         if task is not None:
             task.cancel()
-    _pipeline_task = _market_data_task = _keepalive_task = None
+    _pipeline_task = _market_data_task = _keepalive_task = _outcome_task = None

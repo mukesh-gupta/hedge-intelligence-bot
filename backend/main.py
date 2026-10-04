@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from backend import pipeline, scheduler, realtime
+from backend import outcomes, pipeline, scheduler, realtime
 
 _realtime_task = None
 
@@ -110,6 +110,14 @@ def get_status():
         "signals_today": len(s.trade_history),
         "write_endpoints_protected": bool(ADMIN_TOKEN),
     }
+
+
+@app.get("/api/scorecard")
+def get_scorecard(days: int = 7):
+    """How often signals' calls came true, 1 hour and 1 day after they were published."""
+    if not 1 <= days <= outcomes.STATS_KEEP_DAYS:
+        raise HTTPException(status_code=400, detail=f"days must be between 1 and {outcomes.STATS_KEEP_DAYS}")
+    return outcomes.scorecard(days)
 
 
 @app.get("/api/errors")
