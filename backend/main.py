@@ -105,6 +105,9 @@ def get_status():
         "data_pipeline": s.last_error is None or not cooldown_active,
         "cache_age_seconds": round(time.time() - s.cache_last_updated, 1) if s.cache_last_updated else None,
         "memory_mb": pipeline.process_memory_mb(),
+        # The day the stored signals belong to (IST); everything older is deleted at its start.
+        "data_day": pipeline.local_today(),
+        "signals_today": len(s.trade_history),
         "write_endpoints_protected": bool(ADMIN_TOKEN),
     }
 

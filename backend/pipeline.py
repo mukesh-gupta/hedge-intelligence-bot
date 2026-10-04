@@ -111,9 +111,13 @@ HEADLINES_SAVE_INTERVAL_SECONDS = 300
 # this share of meaningful words overlaps with a story already accepted in the window.
 DEDUP_SIMILARITY = 0.5
 DEDUP_WINDOW_SECONDS = 6 * 3600
-# Signals and seen-headlines older than this are deleted from memory and Upstash. Checked
-# once a day (and at startup), so data is gone within a day of turning 7 days old.
-RETENTION_DAYS = 7
+# The bot keeps one day of data. Each new day starts empty: the previous days' signals and
+# stale seen-headline markers are deleted from memory and Upstash at local midnight, and at
+# startup in case the process was down or redeployed across midnight. The watchlist is a
+# setting, not daily data, and is kept.
+# The day boundary is India time, as a fixed UTC offset: IST has no daylight saving, so no
+# timezone database is needed. The server itself runs in UTC.
+DAY_UTC_OFFSET = timedelta(hours=5, minutes=30)
 DEFAULT_WATCHLIST = [
     {"symbol": "NDAQ", "label": "NDAQ"},
     {"symbol": "MS", "label": "MS"},
@@ -139,7 +143,7 @@ class PipelineState:
         self.qualified_headlines = []
         self.headline_metadata = {}
 
-        self.token_usage_date = datetime.now().strftime("%Y-%m-%d")
+        self.token_usage_date = local_today()
         self.groq_tokens_today = 0
         self.openrouter_tokens_today = 0
         self.gemini_tokens_today = 0
@@ -175,7 +179,7 @@ class PipelineState:
         self.cache_last_updated = None
 
     def roll_daily_usage_if_needed(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = local_today()
         if self.token_usage_date != today:
             self.token_usage_date = today
             self.groq_tokens_today = 0
@@ -186,50 +190,59 @@ class PipelineState:
             self.av_exhausted = False
             self.market_data_cache = {}
             self.symbol_cache = {}
-            prune_old_data()
+            delete_previous_days_data()
+
+
+def local_today():
+    """Today's date in the day-boundary timezone (see DAY_UTC_OFFSET)."""
+    return (datetime.utcnow() + DAY_UTC_OFFSET).strftime("%Y-%m-%d")
+
+
+def start_of_today_utc():
+    """The moment today began in the day-boundary timezone, as naive UTC — the form signal
+    timestamps are stored in."""
+    local_now = datetime.utcnow() + DAY_UTC_OFFSET
+    return local_now.replace(hour=0, minute=0, second=0, microsecond=0) - DAY_UTC_OFFSET
 
 
 def _alert_time(alert):
-    """Parses an alert's UTC ISO Timestamp. Alerts from before the switch to ISO timestamps
-    stored only a time-of-day with no date — they return None and are treated as expired."""
-    try:
-        return datetime.fromisoformat(alert.get("Timestamp", "").removesuffix("Z"))
-    except (TypeError, ValueError):
-        return None
+    """When a signal was generated (naive UTC): its Processed At, or for signals from before
+    that field existed, the article's publish Timestamp. None if neither parses."""
+    for field in ("Processed At", "Timestamp"):
+        try:
+            return datetime.fromisoformat((alert.get(field) or "").removesuffix("Z"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return None
 
 
-def prune_old_data():
-    """Deletes signals and seen-headline markers older than RETENTION_DAYS, in memory and
-    in Upstash, so neither grows indefinitely."""
-    cutoff = datetime.utcnow() - timedelta(days=RETENTION_DAYS)
-    kept_alerts = [a for a in state.trade_history if (_alert_time(a) or datetime.min) >= cutoff]
-    if len(kept_alerts) != len(state.trade_history):
-        removed = len(state.trade_history) - len(kept_alerts)
+def delete_previous_days_data():
+    """Deletes every signal generated before today began, in memory and in Upstash, plus
+    seen-headline markers too old to matter. Run at each day rollover and at startup."""
+    day_start = start_of_today_utc()
+    kept_alerts = [a for a in state.trade_history if (_alert_time(a) or datetime.min) >= day_start]
+    removed = len(state.trade_history) - len(kept_alerts)
+    if removed:
         state.trade_history = kept_alerts
         replace_trade_history(kept_alerts)
-        print(f"[pipeline] Pruned {removed} signals older than {RETENTION_DAYS} days")
+        print(f"[pipeline] Deleted {removed} signals from previous days, kept {len(kept_alerts)} from today")
 
-    cutoff_epoch = time.time() - RETENTION_DAYS * 86400
+    # Markers only exist to stop a story still sitting in a feed from being analyzed twice,
+    # and the freshness window bounds that. Recent ones survive the day change on purpose:
+    # wiping them would re-publish last night's 11:50 PM stories as today's news.
+    cutoff_epoch = time.time() - 2 * MAX_HEADLINE_AGE_MINUTES * 60
     kept_headlines = {t: seen for t, seen in state.processed_headlines.items() if seen >= cutoff_epoch}
     if len(kept_headlines) != len(state.processed_headlines):
-        removed = len(state.processed_headlines) - len(kept_headlines)
         state.processed_headlines = kept_headlines
         save_processed_headlines(kept_headlines)
-        print(f"[pipeline] Pruned {removed} seen-headlines older than {RETENTION_DAYS} days")
 
 
 def load_trade_history():
-    """Signals, newest first, from the Redis list. On the first run after the switch to a
-    list, copies them over from the old single-JSON key (which is left in place, untouched)."""
+    """Signals, newest first, from the Redis list."""
     replies = storage.redis_pipeline([["LRANGE", SIGNALS_KEY, 0, -1]])
     if replies is None:
         return []  # Upstash not configured or unreachable: behave like a cold start
-    if replies[0]:
-        return [json.loads(item) for item in replies[0]]
-    legacy = storage.redis_get_json("trade_history", [])[:MAX_STORED_ALERTS]
-    if legacy and storage.redis_pipeline([["RPUSH", SIGNALS_KEY, *[json.dumps(a) for a in legacy]]]) is None:
-        print("[pipeline] Copying signals to the Redis list failed; will retry next start")
-    return legacy
+    return [json.loads(item) for item in replies[0]]
 
 
 def append_signal(alert):
@@ -241,8 +254,10 @@ def append_signal(alert):
 
 
 def replace_trade_history(history):
-    """Full rewrite — only for the once-a-day retention prune, never per signal."""
-    commands = [["DEL", SIGNALS_KEY]]
+    """Full rewrite — only for the once-a-day deletion, never per signal."""
+    # "trade_history" is the single-JSON key signals lived in before they moved to a list.
+    # It was left behind as a copy at that migration; it is previous-day data like the rest.
+    commands = [["DEL", SIGNALS_KEY], ["DEL", "trade_history"]]
     if history:
         commands.append(["RPUSH", SIGNALS_KEY, *[json.dumps(a) for a in history[:MAX_STORED_ALERTS]]])
     if storage.redis_pipeline(commands) is None:
@@ -251,8 +266,9 @@ def replace_trade_history(history):
 
 def load_processed_headlines():
     """title -> epoch seconds first seen. Insertion-ordered dict so trimming keeps the NEWEST
-    headlines, and timestamped so prune_old_data() can expire them. Older deployments stored
-    a plain list of titles; those get stamped "now" and age out normally from there."""
+    headlines, and timestamped so delete_previous_days_data() can expire them. Older
+    deployments stored a plain list of titles; those get stamped "now" and age out normally
+    from there."""
     stored = storage.redis_get_json("processed_headlines", {})
     if isinstance(stored, list):
         now = time.time()
@@ -299,7 +315,7 @@ def process_memory_mb():
 
 
 state = PipelineState()
-prune_old_data()
+delete_previous_days_data()
 
 
 def _retry_after_seconds(error, default=60):
@@ -1495,6 +1511,11 @@ def _quick_alert(headline, triage):
 
 
 def _publish_alert(headline, alert):
+    # When the signal was generated, as opposed to Timestamp (when the article was
+    # published). The daily deletion goes by this, so a story published at 11:58 PM and
+    # analyzed at 12:01 AM belongs to the new day; the gap between the two is also how
+    # long the bot took to turn the news into a signal.
+    alert["Processed At"] = datetime.utcnow().isoformat() + "Z"
     state.trade_history.insert(0, alert)
     del state.trade_history[MAX_STORED_ALERTS:]
     state.headline_metadata.pop(headline, None)
