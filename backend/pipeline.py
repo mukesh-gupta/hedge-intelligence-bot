@@ -1089,6 +1089,7 @@ _source_last_polled = {}
 _feed_validators = {}  # url -> ETag / Last-Modified, for conditional GETs
 _feed_body_hashes = {}  # url -> hash of the last body parsed, for feeds without validators
 _undated_titles = {}  # source name -> undated titles seen on its previous poll
+_polled_sources = set()  # sources fetched successfully at least once since startup
 _recent_story_tokens = collections.deque(maxlen=2000)  # (accepted_at, word set) for dedup
 _DEDUP_STOPWORDS = frozenset(
     "the a an and or of to in on for with as at by from after amid over its it is are be was "
@@ -1273,6 +1274,10 @@ def fetch_live_financial_news():
         # new on the first poll after startup, when there's no previous poll to compare to.
         undated_before = _undated_titles.get(source["name"])
         _undated_titles[source["name"]] = {title for title, _, published, _ in items if published is None}
+        # Everything in a source's first poll after startup was already sitting in the feed:
+        # how late we see it says how long the bot was down, not how slow the source is.
+        backfill = source["name"] not in _polled_sources
+        _polled_sources.add(source["name"])
         for title, link, published_dt, publisher in items:
             if title in state.processed_headlines:
                 continue
@@ -1296,6 +1301,9 @@ def fetch_live_financial_news():
                 "priority": source.get("priority", False),
                 "published_at": published_dt.isoformat() + "Z",
                 "queued_at": now,
+                "seen_at": datetime.utcnow().isoformat() + "Z",
+                "feed": source["name"],
+                "backfill": backfill,
             }
 
     if marked_any:
@@ -1519,6 +1527,13 @@ def _publish_alert(headline, alert):
     # analyzed at 12:01 AM belongs to the new day; the gap between the two is also how
     # long the bot took to turn the news into a signal.
     alert["Processed At"] = datetime.utcnow().isoformat() + "Z"
+    # For speed measurement (see speed.py): when the bot first saw the headline, in which
+    # feed, whether that was a post-restart backlog item, and whether it took the fast lane.
+    meta = state.headline_metadata.get(headline, {})
+    alert["Seen At"] = meta.get("seen_at")
+    alert["Feed"] = meta.get("feed")
+    alert["Backfill"] = meta.get("backfill", False)
+    alert["Fast Lane"] = meta.get("priority", False)
     # Filled in by outcomes.py once the price has been checked. The key exists from the
     # start so that later updates only replace a value (see outcomes._attach_to_signals).
     alert["Outcome"] = None

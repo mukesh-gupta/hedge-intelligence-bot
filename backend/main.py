@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from backend import outcomes, pipeline, scheduler, realtime
+from backend import outcomes, pipeline, scheduler, realtime, speed
 
 _realtime_task = None
 
@@ -118,6 +118,12 @@ def get_scorecard(days: int = 7):
     if not 1 <= days <= outcomes.STATS_KEEP_DAYS:
         raise HTTPException(status_code=400, detail=f"days must be between 1 and {outcomes.STATS_KEEP_DAYS}")
     return outcomes.scorecard(days)
+
+
+@app.get("/api/speed")
+def get_speed():
+    """How long today's signals took: publish -> seen in a feed -> signal generated."""
+    return speed.stats()
 
 
 @app.get("/api/errors")
