@@ -155,6 +155,7 @@ class PipelineState:
         self.av_exhausted = False
         self.market_data_cache = {}
         self.symbol_cache = {}
+        self.symbol_names = {}  # resolved symbol -> listed name, for showing "TCS.NS (Tata Consultancy Services)"
         self.last_av_call_time = 0
 
         self.last_error = None
@@ -193,6 +194,7 @@ class PipelineState:
             self.av_exhausted = False
             self.market_data_cache = {}
             self.symbol_cache = {}
+            self.symbol_names = {}
             delete_previous_days_data()
 
 
@@ -594,13 +596,21 @@ currency (earnings/guidance surprise, big M&A, central bank or regulatory action
 6-7 = clear but limited impact; 4-5 = minor. Opinion, advice, listicles, previews, recaps with no
 new cause, and news with no plausible price impact score 1-3.
 
+fresh = true only if the headline reports a NEW cause (an event, decision, deal, result, data
+release or shock) whose effect prices may not yet reflect. fresh = false if it mainly reports a
+price move that already happened (stock jumps 9%, gold hits record, Sensex ends lower, stock
+movers, weekly recap) or old news: the move is done, so there is no call left to make.
+
 {numbered}
 
 Output ONLY a JSON array, one object per headline scoring {QUICK_SIGNAL_MIN_IMPACT}+ ([] if none):
-{{"n": headline number, "impact": 1-10, "direction": "BULLISH"|"BEARISH"|"MIXED",
+{{"n": headline number, "impact": 1-10, "fresh": true|false, "direction": "BULLISH"|"BEARISH"|"MIXED",
 "region": "India"|"Commodities"|"Forex"|"Crypto"|"Global", "tickers": [up to 3 Yahoo Finance
-symbols, e.g. AAPL, RELIANCE.NS, ^NSEI, GC=F, EURUSD=X, BTC-USD; [] if private or unsure, never
-guess], "sector": "short name"}}
+symbols, e.g. AAPL, RELIANCE.NS, ^NSEI, GC=F, BTC-USD; [] if private or unsure, never guess],
+"sector": "short name"}}
+tickers = the specific listed companies the news hits hardest, most exposed first; use an index
+(^NSEI, ^GSPC) only when no particular company is named or clearly implied. For a currency give its
+3-letter code (INR, JPY, EUR) and make direction about THAT currency: BULLISH = it strengthens.
 region = the market mainly affected: India (Indian stocks, indices, RBI, rupee), Commodities (oil,
 gas, metals, crops), Forex (currencies), Crypto, otherwise Global."""
     raw_text = call_llm(prompt, tier="fast")
@@ -624,6 +634,8 @@ gas, metals, crops), Forex (currencies), Crypto, otherwise Global."""
         region = str(item.get("region", "")).title()
         triaged[headlines[n - 1]] = {
             "impact": min(impact, 10),
+            # Missing counts as fresh: a model that drops the field must not silence every call.
+            "fresh": item.get("fresh") is not False,
             "direction": direction if direction in ("BULLISH", "BEARISH") else "MIXED",
             # None when the AI gives nothing usable: the alert falls back to the feed's region.
             "region": region if region in SIGNAL_REGIONS else None,
@@ -765,17 +777,92 @@ def resolve_ticker(company_or_ticker):
         quotes = yf.Search(query, timeout=10).quotes
     except Exception:
         return None  # not cached, so a transient failure gets retried next time
-    resolved = next((q["symbol"] for q in quotes if q.get("symbol", "").upper() == query.upper()), None)
-    if not resolved:
+    match = next((q for q in quotes if q.get("symbol", "").upper() == query.upper()), None)
+    if not match:
         wanted = _normalize_company(query)
         for q in quotes:
             listed_name = _normalize_company(q.get("longname") or q.get("shortname") or "")
             if (wanted and q.get("quoteType") == "EQUITY" and not _FUND_NAME.search(listed_name)
                     and re.search(rf"\b{re.escape(wanted)}\b", listed_name)):
-                resolved = q["symbol"]
+                match = q
                 break
+    resolved = match["symbol"] if match else None
+    if match and (match.get("longname") or match.get("shortname")):
+        state.symbol_names.setdefault(resolved, match.get("longname") or match.get("shortname"))
     cache[query] = resolved
     return resolved
+
+
+# Currencies are where a ticker's direction and the news's direction can disagree. Yahoo quotes
+# most currencies as dollars-to-currency ("INR=X" is rupees per dollar), so a STRONGER rupee is
+# INR=X going DOWN. Checked on the live scorecard: the AI wrote INR=X meaning "the rupee", and
+# its forex calls were right 33% of the time at one day: inverted. So the AI now names the
+# currency and the direction of that currency, and this maps it to the pair and the side.
+_DIRECT_PAIRS = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "AUD": "AUDUSD=X", "NZD": "NZDUSD=X"}
+_CURRENCIES = frozenset(
+    "INR JPY CNY CNH CAD CHF EUR GBP AUD NZD SEK NOK DKK MXN BRL ZAR KRW SGD HKD TRY RUB IDR THB PLN "
+    "HUF CZK ILS PHP MYR VND TWD AED SAR ARS CLP EGP PKR BDT LKR NGN KES".split()
+)  # COP and PEN are left out on purpose: they are also ConocoPhillips and Penumbra
+_CURRENCY_TICKER = re.compile(r"^(?:USD([A-Z]{3})=X|([A-Z]{3})USD=X|([A-Z]{3})=X|([A-Z]{3}))$")
+CURRENCY_NAMES = {"DX-Y.NYB": "US Dollar Index"}
+
+
+def currency_instrument(symbol):
+    """For a currency named by the AI in any form (INR, INR=X, USDINR=X, INRUSD=X, USD), the
+    Yahoo symbol to trade and whether that symbol rises when the currency strengthens. None
+    for anything that is not a currency."""
+    text = (symbol or "").strip().upper()
+    if text in ("USD", "DXY", "DX-Y.NYB"):
+        return "DX-Y.NYB", True
+    match = _CURRENCY_TICKER.match(text)
+    code = next((g for g in match.groups() if g), None) if match else None
+    if code not in _CURRENCIES:
+        return None
+    if code in _DIRECT_PAIRS:
+        return _DIRECT_PAIRS[code], True
+    return f"{code}=X", False
+
+
+def ticker_name(symbol):
+    """The listed name behind a symbol, when known: Tata Consultancy Services for TCS.NS."""
+    if symbol in CURRENCY_NAMES:
+        return CURRENCY_NAMES[symbol]
+    match = _CURRENCY_TICKER.match(symbol or "")
+    if match and symbol.endswith("=X"):
+        code = next(g for g in match.groups() if g)
+        return f"{code}/USD" if code in _DIRECT_PAIRS else f"USD/{code}"
+    return state.symbol_names.get(symbol)
+
+
+def ticker_names(*symbol_lists):
+    """{symbol: listed name} for every symbol in the given lists that has a known name."""
+    names = {}
+    for symbols in symbol_lists:
+        for symbol in symbols:
+            name = ticker_name(symbol)
+            if name:
+                names[symbol] = name
+    return names
+
+
+def verified_sides(buy_targets, sell_targets):
+    """Puts AI-named instruments on the buy and sell sides as verified Yahoo symbols, dropping
+    what cannot be verified. A currency whose Yahoo pair moves opposite to the currency lands
+    on the other side: "buy INR" (rupee strengthens) becomes "sell INR=X"."""
+    buy, sell = [], []
+    for symbols, same, opposite in ((buy_targets, buy, sell), (sell_targets, sell, buy)):
+        for symbol in symbols or []:
+            if not isinstance(symbol, str) or not symbol.strip():
+                continue
+            currency = currency_instrument(symbol)
+            if currency:
+                yahoo_symbol, agrees = currency
+                (same if agrees else opposite).append(yahoo_symbol)
+            else:
+                resolved = resolve_ticker(symbol)
+                if resolved:
+                    same.append(resolved)
+    return list(dict.fromkeys(buy)), list(dict.fromkeys(sell))
 
 
 def fetch_market_data(ticker):
@@ -977,7 +1064,11 @@ def run_deep_analysis(headline, sector, resolved_ticker):
     {grounding}
     Provide an institutional-grade trading setup across US Stocks, Indian Markets, Global Stocks, Crypto, and Commodities.
     Only name tickers you are confident are real, exchange-listed symbols, in Yahoo Finance format (AAPL, RELIANCE.NS,
-    KGX.DE, 7203.T); leave a list empty rather than guess.
+    KGX.DE, 7203.T); leave a list empty rather than guess. Name the specific companies most exposed to this news, most
+    exposed first; use an index only when no particular company is affected. For a currency give its 3-letter code (INR,
+    JPY, EUR) in buy_targets if you expect that currency to strengthen, sell_targets if you expect it to weaken.
+    If the headline only reports a price move that has already happened, say so in the strategy and keep both target
+    lists empty rather than chasing the move.
     Also list up to 4 related plays that could ripple from this news across the supply chain, competitors,
     commodities or currencies — specific companies preferred over broad ETFs — each with a direction.
     Keep the strategy field to 2-3 concise sentences (under 60 words) — no filler, no repetition.
@@ -1416,7 +1507,9 @@ def run_pipeline_cycle():
             threshold = deep_impact_threshold()
             for headline, triage in triaged.items():
                 state.headline_metadata.setdefault(headline, {})["triage"] = triage
-                if triage["impact"] >= threshold:
+                # A move that already happened gets no deep analysis: there is no call to
+                # make, and the deep model's daily budget is better spent on fresh news.
+                if triage["impact"] >= threshold and triage.get("fresh", True):
                     state.qualified_headlines.append(headline)
                 else:
                     _publish_alert(headline, _quick_alert(headline, triage))
@@ -1429,7 +1522,11 @@ def run_pipeline_cycle():
     headline = state.qualified_headlines.pop(0)
     triage = _headline_triage(headline)
     primary = (triage.get("tickers") or [None])[0]
-    resolved_ticker = None if (detect_commodity(headline) or detect_index(headline)) else resolve_ticker(primary)
+    currency = currency_instrument(primary)
+    if detect_commodity(headline) or detect_index(headline):
+        resolved_ticker = None
+    else:
+        resolved_ticker = currency[0] if currency else resolve_ticker(primary)
     ai_blueprint = run_deep_analysis(headline, triage.get("sector", "General Markets"), resolved_ticker)
     if ai_blueprint.get("sentiment") == "ERROR" and triage:
         # Deep analysis unavailable — still publish what triage already knows rather than
@@ -1453,6 +1550,7 @@ def run_pipeline_cycle():
 
     ripple_display = "; ".join(f"{r.get('name')} ({r.get('direction')})" for r in ripple_effects if r.get("name")) or "None identified"
     source_meta = state.headline_metadata.get(headline, {})
+    buy_tickers, sell_tickers = verified_sides(ai_blueprint.get("buy_targets"), ai_blueprint.get("sell_targets"))
 
     new_alert = {
         # The article's actual RSS publish time (UTC, ISO 8601) — not when our
@@ -1465,8 +1563,10 @@ def run_pipeline_cycle():
         # Always a string: the frontend calls .toUpperCase() on it.
         "Sentiment": ai_blueprint.get("sentiment") or "NEUTRAL",
         "Sector": ai_blueprint.get("sector") or triage.get("sector", "General Markets"),
-        "Buy Tickers": ", ".join(_valid_tickers(ai_blueprint.get("buy_targets"))),
-        "Sell Tickers": ", ".join(_valid_tickers(ai_blueprint.get("sell_targets"))),
+        "Buy Tickers": ", ".join(buy_tickers),
+        "Sell Tickers": ", ".join(sell_tickers),
+        "Ticker Names": ticker_names(buy_tickers, sell_tickers),
+        "Catalyst": "Fresh",
         "Execution Blueprint": ai_blueprint.get("strategy"),
         "Grounded Data": grounded_reading,
         "Ripple Effects (AI-inferred, unverified)": ripple_display,
@@ -1489,26 +1589,42 @@ def _headline_triage(headline):
 def _valid_tickers(symbols):
     """AI-named tickers that resolve to real listed symbols; unverifiable ones are dropped
     rather than shown as tradeable."""
-    resolved = (resolve_ticker(str(s)) for s in (symbols or []) if isinstance(s, str))
-    return list(dict.fromkeys(t for t in resolved if t))
+    buy, sell = verified_sides(symbols, [])
+    return list(dict.fromkeys(buy + sell))
 
 
 def _quick_alert(headline, triage):
     """A signal built from the triage answer alone — no extra AI call — for headlines that
     matter but don't clear the deep-analysis bar, or when deep analysis is unavailable."""
     meta = state.headline_metadata.get(headline, {})
-    tickers = _valid_tickers(triage["tickers"])
     direction = triage["direction"]
+    fresh = triage.get("fresh", True)
+    if not fresh:
+        # The move already happened: the tickers are shown for reference but no call is
+        # made on them, so the scorecard is not charged for chasing a move that is over.
+        blueprint = f"Already priced in (impact {triage['impact']}/10): this reports a move that has already happened, not a new catalyst. No directional call."
+        direction = "MIXED"
+        buy, sell = [], []
+        tickers = _valid_tickers(triage["tickers"])
+    else:
+        blueprint = f"Quick signal (impact {triage['impact']}/10) — scored by AI triage, not deep-analyzed."
+        buy, sell = {
+            "BULLISH": lambda: verified_sides(triage["tickers"], []),
+            "BEARISH": lambda: verified_sides([], triage["tickers"]),
+        }.get(direction, lambda: ([], []))()
+        tickers = _valid_tickers(triage["tickers"]) if direction == "MIXED" else buy + sell
     return {
         "Timestamp": meta.get("published_at") or datetime.utcnow().isoformat() + "Z",
         "Headline": headline,
         "Summary": None,
         "Sentiment": {"BULLISH": "BULLISH", "BEARISH": "BEARISH"}.get(direction, "NEUTRAL"),
         "Sector": triage["sector"],
-        "Buy Tickers": ", ".join(tickers) if direction == "BULLISH" else "",
-        "Sell Tickers": ", ".join(tickers) if direction == "BEARISH" else "",
+        "Buy Tickers": ", ".join(buy),
+        "Sell Tickers": ", ".join(sell),
         "Tickers": ", ".join(tickers),
-        "Execution Blueprint": f"Quick signal (impact {triage['impact']}/10) — scored by AI triage, not deep-analyzed.",
+        "Ticker Names": ticker_names(tickers, buy, sell),
+        "Catalyst": "Fresh" if fresh else "Priced in",
+        "Execution Blueprint": blueprint,
         "Grounded Data": "Not fetched for quick signals",
         "Ripple Effects (AI-inferred, unverified)": "None identified",
         "Category": "Market News",
@@ -1519,6 +1635,11 @@ def _quick_alert(headline, triage):
         "Source": meta.get("source"),
         "Article Link": meta.get("link"),
     }
+
+
+# Set by outcomes.py at import: alert -> the expected hit rate of its call, from the scorecard.
+# A hook rather than an import because outcomes imports this module.
+hit_rate_hook = None
 
 
 def _publish_alert(headline, alert):
@@ -1537,6 +1658,13 @@ def _publish_alert(headline, alert):
     # Filled in by outcomes.py once the price has been checked. The key exists from the
     # start so that later updates only replace a value (see outcomes._attach_to_signals).
     alert["Outcome"] = None
+    # How often calls like this one (same impact, analysis depth, region and direction) have
+    # come true at one day, from the live scorecard; None until there is enough history.
+    try:
+        alert["Hit Rate"] = hit_rate_hook(alert) if hit_rate_hook else None
+    except Exception as e:
+        report_error("Hit rate", e)
+        alert["Hit Rate"] = None
     state.outcome_queue.append(alert)
     state.trade_history.insert(0, alert)
     del state.trade_history[MAX_STORED_ALERTS:]

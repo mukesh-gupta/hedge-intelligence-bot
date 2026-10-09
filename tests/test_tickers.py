@@ -75,3 +75,39 @@ def test_a_failed_search_is_not_cached(fake_search):
 
 def test_valid_tickers_drops_what_cannot_be_verified():
     assert pipeline._valid_tickers(["Oracle", "XYZFAKE", "ORACLE_TYPO", None, "Oracle", "GC=F"]) == ["ORCL", "GC=F"]
+
+
+def test_resolving_records_the_listed_name():
+    pipeline.resolve_ticker("Reliance Industries")
+    pipeline.resolve_ticker("Oracle")
+    assert pipeline.ticker_names(["RELIANCE.NS", "ORCL", "XYZFAKE"]) == {
+        "RELIANCE.NS": "Reliance Industries Limited", "ORCL": "Oracle Corporation",
+    }
+
+
+@pytest.mark.parametrize("symbol, expected", [
+    ("INR", ("INR=X", False)),  # Yahoo's INR=X is rupees per dollar: it falls as the rupee strengthens
+    ("INR=X", ("INR=X", False)),
+    ("USDINR=X", ("INR=X", False)),
+    ("INRUSD=X", ("INR=X", False)),
+    ("jpy", ("JPY=X", False)),
+    ("EUR", ("EURUSD=X", True)),  # quoted as dollars per euro: moves with the euro
+    ("GBPUSD=X", ("GBPUSD=X", True)),
+    ("USD", ("DX-Y.NYB", True)),
+    ("AAPL", None),
+    ("GC=F", None),
+    ("COP", None),  # ConocoPhillips, not the Colombian peso
+    ("IBM", None),
+    ("", None),
+    (None, None),
+])
+def test_currency_instrument(symbol, expected):
+    assert pipeline.currency_instrument(symbol) == expected
+
+
+def test_a_currency_call_lands_on_the_side_its_pair_moves():
+    # Checked on the live scorecard: forex calls were right 33% of the time at one day, because
+    # "rupee strengthens" was published as buy INR=X — a pair that falls when the rupee rises.
+    assert pipeline.verified_sides(["INR", "Oracle"], ["EUR", "XYZFAKE"]) == (["ORCL"], ["INR=X", "EURUSD=X"])
+    assert pipeline.verified_sides([], ["JPY", "GBP"]) == (["JPY=X"], ["GBPUSD=X"])
+    assert pipeline.ticker_names(["INR=X", "EURUSD=X", "DX-Y.NYB"]) == {"INR=X": "USD/INR", "EURUSD=X": "EUR/USD", "DX-Y.NYB": "US Dollar Index"}

@@ -31,6 +31,10 @@ MAX_CHECKS_PER_RUN = 25
 QUOTE_CACHE_SECONDS = 60
 STATS_KEEP_DAYS = 30
 RECENT_KEEP = 200
+# A signal's expected hit rate is read off the scorecard buckets it falls in (impact, analysis
+# depth, region, direction). A bucket counts only once this many of its calls have been decided.
+HIT_RATE_MIN_DECIDED = 30
+HIT_RATE_HORIZON = "1d"
 
 PENDING_KEY = "outcome_pending"  # hash: signal id -> prediction awaiting its checks
 STATS_KEY = "outcome_stats"  # hash: day (YYYY-MM-DD, of the signal) -> that day's tallies
@@ -77,18 +81,24 @@ def fetch_quote(symbol):
     return None
 
 
+def _first(tickers):
+    return next((t.strip() for t in (tickers or "").split(",") if t.strip()), None)
+
+
 def _prediction_from(alert):
-    """The one directional call a signal makes: its sentiment, on the first ticker it names
-    on that side (first buy ticker if bullish, first sell ticker if bearish). None when the
-    signal is neutral or names no ticker — there is nothing to score."""
+    """The one directional call a signal makes: the first ticker on its sentiment's side
+    (buy if bullish, sell if bearish), expected to move that side's way. When that side is
+    empty the other side's first ticker counts, the other way: a bullish call on the rupee
+    is "sell INR=X", since that pair falls as the rupee strengthens. None when the signal is
+    neutral or names no ticker — there is nothing to score."""
     sentiment = (alert.get("Sentiment") or "").upper()
+    buy, sell = _first(alert.get("Buy Tickers")), _first(alert.get("Sell Tickers"))
     if "BULLISH" in sentiment:
-        direction, tickers = "UP", alert.get("Buy Tickers")
+        ticker, direction = (buy, "UP") if buy else (sell, "DOWN")
     elif "BEARISH" in sentiment:
-        direction, tickers = "DOWN", alert.get("Sell Tickers")
+        ticker, direction = (sell, "DOWN") if sell else (buy, "UP")
     else:
         return None
-    ticker = next((t.strip() for t in (tickers or "").split(",") if t.strip()), None)
     if not ticker:
         return None
     return {
@@ -257,6 +267,32 @@ def run_cycle():
     return {"started": started, "scored": len(scored)}
 
 
+def hit_rate(alert):
+    """Expected accuracy of a signal's call, from the one-day scorecard over every kept day:
+    the mean accuracy of the buckets it falls in (its impact, analysis depth, region and
+    direction), each counted only once HIT_RATE_MIN_DECIDED of its calls have been decided.
+    None for a signal that makes no call, or before there is enough history. `sample` is
+    the smallest bucket's decided count: how thin the evidence is."""
+    prediction = _prediction_from(alert)
+    if prediction is None:
+        return None
+    totals = {}
+    for per_horizon in stats.values():
+        for key, tally in per_horizon.get(HIT_RATE_HORIZON, {}).items():
+            merged = totals.setdefault(key, [0, 0])
+            merged[0] += tally[RIGHT]
+            merged[1] += tally[WRONG]
+    rates, samples = [], []
+    for dimension in ("impact", "analysis", "region", "direction"):
+        right, wrong = totals.get(f"{dimension}:{prediction.get(dimension)}", (0, 0))
+        if right + wrong >= HIT_RATE_MIN_DECIDED:
+            rates.append(right / (right + wrong))
+            samples.append(right + wrong)
+    if not rates:
+        return None
+    return {"percent": round(sum(rates) / len(rates) * 100, 1), "sample": min(samples), "horizon": HIT_RATE_HORIZON}
+
+
 def _summary(tally):
     right, wrong, flat, closed = tally
     decided = right + wrong
@@ -311,3 +347,4 @@ def scorecard(days=7):
 
 
 load()
+pipeline.hit_rate_hook = hit_rate

@@ -104,13 +104,24 @@ def test_triage_reads_scores_and_drops_low_impact(monkeypatch):
         {"n": 3, "impact": 8, "direction": "BEARISH", "region": "Global", "tickers": ["NKE", "LULU", "DECK", "ADDYY"], "sector": "Apparel"},
     ]))
     assert set(result) == {HEADLINES[0], HEADLINES[2]}
-    assert result[HEADLINES[0]] == {"impact": 9, "direction": "BEARISH", "region": "India", "tickers": ["^NSEI"], "sector": "Finance"}
+    assert result[HEADLINES[0]] == {"impact": 9, "fresh": True, "direction": "BEARISH", "region": "India", "tickers": ["^NSEI"], "sector": "Finance"}
     assert result[HEADLINES[2]]["tickers"] == ["NKE", "LULU", "DECK"]  # capped at three
 
 
 def test_triage_tolerates_code_fences_and_odd_values(monkeypatch):
     result = _triage(monkeypatch, '```json\n[{"n": 1, "impact": 12, "direction": "sideways", "region": "Mars"}, {"n": 99, "impact": 8}, {"impact": 8}]\n```')
-    assert result == {HEADLINES[0]: {"impact": 10, "direction": "MIXED", "region": None, "tickers": [], "sector": "General Markets"}}
+    assert result == {HEADLINES[0]: {"impact": 10, "fresh": True, "direction": "MIXED", "region": None, "tickers": [], "sector": "General Markets"}}
+
+
+def test_triage_reads_the_fresh_flag(monkeypatch):
+    # "Nike shares plummet 10%" reports a move that already happened: fresh is false. A
+    # missing flag counts as fresh, so a model that drops the field cannot silence every call.
+    result = _triage(monkeypatch, json.dumps([
+        {"n": 1, "impact": 9, "fresh": True, "direction": "BEARISH"},
+        {"n": 2, "impact": 7, "direction": "BULLISH"},
+        {"n": 3, "impact": 8, "fresh": False, "direction": "BEARISH", "tickers": ["NKE"]},
+    ]))
+    assert [result[h]["fresh"] for h in HEADLINES] == [True, True, False]
 
 
 def test_triage_with_no_qualifying_headlines(monkeypatch):
@@ -235,6 +246,34 @@ def test_impact_decides_between_dropped_quick_and_deep(loop):
     assert by_headline["big"]["Region"] == "India"  # the triage region, not the feed's
     assert by_headline["big"]["Feed"] == "Test" and by_headline["big"]["Fast Lane"] is True
     assert all(a["Seen At"] is None or isinstance(a["Seen At"], str) for a in by_headline.values())
+
+
+def test_a_move_that_already_happened_gets_no_call_and_no_deep_analysis(loop):
+    # Seen live: "US Telecom Stocks Sink 9%" published as BEARISH on VZ after the fall, and
+    # "Gold hits two-month low" as BEARISH on gold, which then bounced. Chasing a finished
+    # move is a coin flip, so a stale headline is shown for reference with no call on it.
+    loop["triage_result"] = {
+        "Nike shares plummet 10% after earnings": {"impact": 9, "fresh": False, "direction": "BEARISH", "region": "Global", "tickers": ["NKE"], "sector": "Apparel"},
+    }
+    loop["queue"]("Nike shares plummet 10% after earnings", priority=True)
+    loop["run"]()
+    loop["run"]()
+    (alert,) = pipeline.state.trade_history
+    assert loop["deep"] == []
+    assert alert["Analysis"] == "Quick" and alert["Catalyst"] == "Priced in"
+    assert alert["Sentiment"] == "NEUTRAL" and alert["Buy Tickers"] == "" and alert["Sell Tickers"] == ""
+    assert alert["Tickers"] == "NKE"  # still named, for the reader
+    assert "already happened" in alert["Execution Blueprint"]
+
+
+def test_quick_signal_puts_a_currency_on_the_side_its_pair_moves(loop):
+    # "Rupee rises" is bullish on the rupee; the Yahoo pair INR=X (rupees per dollar) falls.
+    loop["triage_result"] = {"Rupee rises 23 paise": {"impact": 6, "fresh": True, "direction": "BULLISH", "region": "Forex", "tickers": ["INR"], "sector": "Forex"}}
+    loop["queue"]("Rupee rises 23 paise", priority=True)
+    loop["run"]()
+    (alert,) = pipeline.state.trade_history
+    assert alert["Sentiment"] == "BULLISH" and alert["Buy Tickers"] == "" and alert["Sell Tickers"] == "INR=X"
+    assert alert["Catalyst"] == "Fresh" and alert["Ticker Names"] == {"INR=X": "USD/INR"}
 
 
 def test_failed_deep_analysis_still_publishes_a_quick_signal(loop, monkeypatch):

@@ -45,6 +45,14 @@ def test_only_signals_with_a_direction_and_a_priced_ticker_are_tracked(quotes, p
     assert len(upstash.db["outcome_pending"]) == 2
 
 
+def test_a_call_whose_only_ticker_is_on_the_other_side_is_scored_that_way(quotes, publish):
+    # Bullish on the rupee is published as "sell INR=X": the call is that INR=X falls.
+    quotes.set("INR=X", 88.0)
+    alert = publish("rupee rises", "BULLISH", sell="INR=X")
+    outcomes.run_cycle()
+    assert alert["Outcome"]["ticker"] == "INR=X" and alert["Outcome"]["direction"] == "DOWN"
+
+
 def test_every_signal_has_an_outcome_key_from_the_start(publish):
     # Later updates must only replace the value: the API may be serializing the dict.
     assert "Outcome" in publish("anything", "NEUTRAL")
@@ -228,3 +236,30 @@ def test_checks_per_run_are_capped(quotes, publish, clock):
     clock.advance(minutes=61)
     assert outcomes.run_cycle()["scored"] == outcomes.MAX_CHECKS_PER_RUN
     assert outcomes.run_cycle()["scored"] == 10
+
+
+def _decided(right, wrong):
+    return [right, wrong, 0, 0]
+
+
+def test_hit_rate_comes_from_the_buckets_a_signal_falls_in(publish):
+    outcomes.stats["2026-10-04"] = {"1d": {
+        "impact:9": _decided(20, 10), "analysis:Deep": _decided(30, 20), "region:India": _decided(10, 10),
+        "direction:UP": _decided(5, 5), "direction:DOWN": _decided(0, 40),
+    }}
+    outcomes.stats["2026-10-05"] = {"1d": {"region:India": _decided(20, 20)}, "1h": {"impact:9": _decided(100, 0)}}
+    alert = publish("call", "BULLISH", buy="AAA", Impact=9, Analysis="Deep", Region="India")
+    # impact 9: 20/30; Deep: 30/50; India over both days: 30/60; UP has only 10 decided, so it
+    # is left out; the 1-hour tallies are not used.
+    assert alert["Hit Rate"] == {"percent": round((20 / 30 + 30 / 50 + 30 / 60) / 3 * 100, 1), "sample": 30, "horizon": "1d"}
+    # DOWN has 40 decided (all wrong), so it joins the mean for a bearish call.
+    assert publish("bearish call", "BEARISH", sell="AAA", Impact=9, Analysis="Deep", Region="India")["Hit Rate"]["percent"] == round((20 / 30 + 30 / 50 + 30 / 60 + 0) / 4 * 100, 1)
+
+
+def test_hit_rate_is_none_without_a_call_or_enough_history(publish):
+    assert publish("no history yet", "BULLISH", buy="AAA")["Hit Rate"] is None
+    outcomes.stats["2026-10-04"] = {"1d": {"impact:7": _decided(29, 0)}}
+    assert publish("too thin", "BULLISH", buy="AAA", Impact=7)["Hit Rate"] is None
+    outcomes.stats["2026-10-05"] = {"1d": {"impact:7": _decided(1, 0)}}
+    assert publish("enough now", "BULLISH", buy="AAA", Impact=7)["Hit Rate"] == {"percent": 100.0, "sample": 30, "horizon": "1d"}
+    assert publish("neutral", "NEUTRAL", Impact=7)["Hit Rate"] is None
