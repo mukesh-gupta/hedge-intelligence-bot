@@ -42,10 +42,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Hedge Intelligence Terminal API", lifespan=lifespan)
 
-# Wide open for localhost dev — the future React dev server (Vite default: 5173) calls this.
+# Browser origins allowed to call this API directly. The deployed frontend reads straight
+# from here — relaying each poll through a Vercel function cost an invocation every time,
+# which is what exhausted that plan's monthly allowance — so its origin must be listed:
+# CORS_ORIGINS="https://hedge-intel-frontend.vercel.app" (comma-separated for several);
+# CORS_ORIGIN_REGEX can admit preview deployments. Localhost dev servers are always allowed.
+DEV_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+CORS_ORIGINS = DEV_ORIGINS + [
+    origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=os.getenv("CORS_ORIGIN_REGEX") or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
